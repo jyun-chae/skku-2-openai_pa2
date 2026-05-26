@@ -1,180 +1,137 @@
-# FFHQ-256 baseline — student package
+# Project 2 FFHQ StyleGAN
 
-This package contains everything you need to load the distributed 256×256
-baseline, sample from it, and fine-tune it up to 512 or 1024.
+Self-contained PyTorch implementation for Project 2 image generation.  The
+default model is a StyleGAN2-inspired GAN trained from noise to 1024x1024 RGB
+faces.
 
-```
-ffhqgen_student/
-├── README.md
-├── requirements.txt
-├── train.py                       training loop (fine-tune the baseline, or resume)
-├── generate.py                    sample grid from any ckpt
-├── export_onnx.py                 leaderboard submission: (B,512) → (B,3,1024,1024)
-├── ckpt/
-│   └── ffhq256_baseline.pt        239 MB — G + D + G_ema state_dicts (slim)
-├── configs/
-│   └── baseline_256.yaml          starting config (matches the distributed ckpt)
-└── src/
-    ├── __init__.py
-    ├── model.py                   Generator / Discriminator / EMA / baseline builders
-    ├── losses.py                  non-saturating logistic + R1
-    ├── augment.py                 DiffAug (color / translation / cutout)
-    └── dataset.py                 zip-backed image dataset
-```
-
-The baseline was trained on FFHQ (50k images) for 5.0M images at 256×256. It's
-intentionally **higher quality than "mediocre"** — your fine-tune starts from
-a non-trivial starting point so the work focuses on upscaling and refinement,
-not basic face structure.
-
-## Quick start
-
-Run everything from the package root (`ffhqgen_student/`):
+## Requirements
 
 ```bash
 pip install -r requirements.txt
-
-# 1. Verify the baseline loads and samples
-python generate.py --ckpt ckpt/ffhq256_baseline.pt \
-                           --out sample_256.png --n 64
-
-# 2. Fine-tune at 256 to verify your training loop works
-python train.py --config configs/baseline_256.yaml \
-                       --init-from ckpt/ffhq256_baseline.pt
-
-# 3. Scale up: write a new config (e.g., configs/baseline_1024.yaml),
-#    extend the architecture, write your own transfer-init logic, and run
-#    train.py with that config.
 ```
 
-## Architecture (`src/model.py`)
+Allowed project libraries are kept to PyTorch/TorchVision, Pillow, NumPy,
+PyYAML, WandB, and ONNX tooling.  The code does not use HuggingFace libraries,
+PyTorch Lightning, Accelerate, Albumentations, external model repositories, or
+pretrained models.
 
-Config-driven ResNet GAN:
-- **Generator** 21.2M params: `z(512) → Linear → 4×4 → ResBlockUp×6 → 256×256`,
-  Group Norm, self-attention at 32×32, tanh output.
-- **Discriminator** 20.2M params: mirror of G with Spectral Norm everywhere,
-  MinibatchStd, no normalization layer in residual blocks.
-- **EMA**: half-life 10k images. `G_ema_state` is what you sample from for FID.
+## Data
 
-Extending to 512 or 1024 is a config change only — see below.
+Put the announced training split zip at:
 
-## Scaling to 512 / 1024
+```text
+data/train_50k_1024.zip
+```
 
-This is the core of the assignment — designing the additional up-block(s)
-that take 256→512 (and 512→1024), and the matching down-block(s) on D.
-Decide on your own:
+Do not train on the valid or test split.  The zip should contain 1024x1024 JPG
+or PNG images.
 
-- **Block design.** ResBlockUp-style (NN-upsample + Conv + Conv)? Sub-pixel
-  conv? Transposed conv? Something else? `model.py` ships the baseline's
-  ResBlockUp / ResBlockDown, but you're not required to reuse them — the
-  assignment grades the resulting FID, not the architecture.
-- **Channels.** How many channels at 512 / 1024? Halving each step
-  (...256:64, 512:32, 1024:16) is a sensible default but not the only choice.
-
-
-`train.py --init-from ffhq256_baseline.pt` loads the baseline with
-`strict=True` — it only works when your architecture is *exactly* the 256
-baseline. As soon as you change the architecture, replace `init_from_baseline`
-(in `train.py`) with your own loader.
-
-For the leaderboard submission, your trained model only has to satisfy the
-ONNX interface in `export_onnx.py` (input: `(B, 512)` z, output:
-`(B, 3, 1024, 1024)` image). Anything in between is up to you.
-
-## Training recipe (and why)
-
-The settings in `baseline_256.yaml` were arrived at after **three divergences**
-during the baseline run. Lessons:
-
-| Setting | Value | Lesson |
-|---|---|---|
-| `beta2` | **0.9** | 0.99 averages too long — when a gradient spike hits, Adam takes too long to adapt and the run blows up. |
-| `lr_g`, `lr_d` | both **1e-3** | TTUR (lower D lr) caused D under-training and mode collapse. Symmetric lr was stable. |
-| `r1_gamma` | **10** | Higher γ (20, 30) suppressed D learning too much. |
-| `augment` | `color,translation` | DiffAug **cutout 50%** was too aggressive — masked-out regions starved D. |
-| `precision` | **fp32** | bf16 trained fine for ~3M images then a late spike was easier to diagnose in fp32. Either works. |
-| `grad_clip_d` | 100 (effectively off) | D has Spectral Norm — already bounded; clipping is a no-op. |
-| `grad_clip_g` | 10 | Real protection on G — has caught grad spikes without distorting training. |
-
-### Measuring FID
-
-The leaderboard ranks by FID, so you may want a number to track. 
-
-- Dump a few thousand samples from your model (via `generate.py` in
-  a loop, or directly from the ONNX session) into a directory.
-- Use `pytorch-fid` (`pip install pytorch-fid`) on that directory vs a
-  directory of real images at the same resolution: `python -m pytorch_fid
-  <samples_dir> <real_dir>`. Cache the real-side Inception statistics with
-  `--save-stats` so subsequent FID runs only re-extract the fake side.
-- The leaderboard uses the same `pytorch-fid` Inception features, so this is
-  your honest self-check before submission.
-
-
-## Inference / sampling
+## Progressive Training
 
 ```bash
-# from the slim baseline ckpt
-python generate.py --ckpt ckpt/ffhq256_baseline.pt --n 64 --out grid.png
-
-# from your own fine-tune ckpt (auto-detects architecture from meta)
-python generate.py --ckpt runs/my_run/ckpt_001000000.pt --n 64
-
-# without EMA (raw G — usually noticeably worse)
-python generate.py --ckpt ckpt/ffhq256_baseline.pt --no-ema --n 64
+python train.py --config configs/stylegan_256.yaml
+python train.py --config configs/stylegan_512.yaml --init-from runs/stylegan_256/final.pt
+python train.py --config configs/stylegan_1024.yaml --init-from runs/stylegan_512/final.pt
 ```
 
-## Leaderboard submission (ONNX export)
+On Colab, use `main.ipynb`. It mounts Google Drive, installs dependencies,
+logs into W&B with an entered API key, and saves checkpoints under
+`/content/drive/MyDrive/project02/runs/`.
 
-Every leaderboard entry exports a single ONNX file with this fixed interface:
-
-```
-input  z      shape (B, 512), dtype float32
-output image  shape (B, 3, 1024, 1024), dtype float32, range [-1, 1]
-```
-
-The `SubmissionWrapper` in `export_onnx.py` runs your Generator and
-resizes the output to 1024×1024 with bilinear interpolation — so 256-, 512-,
-and 1024-native models all submit through the same contract. The grader
-doesn't need to know your architecture.
-
-For the baseline 256 (sanity check the pipeline):
+For Colab, run training in shorter chunks and resume from `latest.pt`:
 
 ```bash
-python export_onnx.py --ckpt ckpt/ffhq256_baseline.pt \
-                              --out submission.onnx
+python train.py --config configs/stylegan_256.yaml --max-steps 2000
+python train.py --config configs/stylegan_256.yaml --resume runs/stylegan_256/latest.pt --max-steps 2000
 ```
 
-For your own fine-tuned model (any architecture), call the Python API from
-the package root:
+Each stage config saves both image-count checkpoints and step-count
+checkpoints.  By default it writes:
 
-```python
-import torch
-from src.model import Generator, GeneratorConfig
-from export_onnx import export_to_onnx
+- `latest.pt` every `ckpt_every_steps`
+- `ckpt_step_XXXXXXXX.pt` every `ckpt_every_steps`
+- `ckpt_XXXXXXXXX.pt` every `ckpt_every` images
+- `final.pt` only when the configured `total_images` target is reached
 
-G = Generator(GeneratorConfig(z_dim=512, resolutions=..., channels=..., ...))
-G.load_state_dict(torch.load("my_ckpt.pt", weights_only=True)["G_ema_state"])
-export_to_onnx(G, "submission.onnx")
-```
-
-Verify locally with onnxruntime before submitting:
-
-```python
-import numpy as np, onnxruntime as ort
-sess = ort.InferenceSession("submission.onnx")
-out = sess.run(None, {"z": np.random.randn(4, 512).astype(np.float32)})[0]
-assert out.shape == (4, 3, 1024, 1024)
-```
-
-## Resuming your own run
-
-`train.py --resume` restores G/D/G_ema/optimizers/RNG/wandb run id, so an
-interrupted run continues bit-for-bit:
+You can override the step save interval from the command line:
 
 ```bash
-python train.py --config configs/baseline_256.yaml \
-                       --resume runs/my_run/ckpt_001000000.pt
+python train.py --config configs/stylegan_256.yaml --max-steps 2000 --save-every-steps 250
 ```
 
-Do not mix `--init-from` and `--resume` — `--init-from` is for the *first*
-launch of a fine-tune, `--resume` is for continuing an in-progress one.
+The three configs use matching low-resolution generator blocks, so each stage
+can reuse the earlier stage's mapping network and synthesis blocks.  Newly
+introduced high-resolution blocks start from random initialization.  The
+discriminator is also partially loaded where tensor shapes match, but it is
+expected to adapt more heavily at each new resolution.
+
+The training loop keeps the original baseline flow where it is useful:
+
+- zip-backed dataset loader
+- DiffAugment `color,translation`
+- non-saturating logistic GAN loss
+- lazy R1 regularization
+- EMA generator
+- checkpoint/resume support
+- WandB logging for losses, discriminator scores, image statistics, gradient
+  norms, throughput, parameter counts, sample grids, and stage metadata
+
+WandB is configured separately in each stage config:
+
+```yaml
+wandb:
+  project: ffhqgen-student
+  name: stylegan_256
+  mode: online
+```
+
+Set `mode: offline` or `mode: disabled` if needed.
+
+## Model
+
+`src/model.py` defines the generator, discriminator, and EMA.
+
+Generator:
+
+- input: `(B, 512)` Gaussian noise
+- mapping network: 4-layer MLP from `z` to `w`
+- synthesis: learned 4x4 constant, styled convolutions with AdaIN, per-layer
+  noise injection, skip ToRGB outputs
+- output: `(B, 3, 1024, 1024)` in `[-1, 1]`
+- parameter count: about 27.87M at the 1024 stage, under the 50M hard threshold
+
+Discriminator:
+
+- StyleGAN2-like residual downsampling blocks
+- spectral normalization
+- minibatch standard deviation
+- trained jointly with G
+
+## Generate
+
+```bash
+python generate.py --ckpt runs/stylegan_1024/final.pt --out samples/grid.png --n 16
+```
+
+`generate.py` reads `meta.generator_config` from checkpoints saved by
+`train.py`, so it reconstructs the trained architecture automatically.
+
+## Export ONNX
+
+```bash
+python export_onnx.py --ckpt runs/stylegan_1024/final.pt --out submission.onnx
+```
+
+The exported interface is:
+
+```text
+input  z      (B, 512), float32
+output image  (B, 3, 1024, 1024), float32, range [-1, 1]
+```
+
+## Resume
+
+```bash
+python train.py --config configs/stylegan_1024.yaml \
+  --resume runs/stylegan_1024/ckpt_000100000.pt
+```

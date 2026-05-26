@@ -1,24 +1,8 @@
-"""FFHQ-256 baseline model — standalone single-file definition.
+"""StyleGAN-inspired generator/discriminator for Project 2.
 
-Contents (everything you need to instantiate G and D and run/fine-tune):
-- GeneratorConfig / DiscriminatorConfig dataclasses
-- norm helpers (GroupNorm, spectral_norm wrapper)
-- building blocks: ResBlockUp, ResBlockDown, MinibatchStd, SelfAttention2d
-- Generator, Discriminator
-- EMA (exponential moving average for G)
-
-Loading the distributed baseline ckpt:
-    import torch
-    from model import build_baseline_256_generator, build_baseline_256_discriminator
-
-    ckpt = torch.load("ffhq256_baseline.pt", map_location="cuda", weights_only=True)
-    G     = build_baseline_256_generator().cuda()
-    D     = build_baseline_256_discriminator().cuda()
-    G_ema = build_baseline_256_generator().cuda()
-
-    G.load_state_dict(ckpt["G_state"])
-    D.load_state_dict(ckpt["D_state"])
-    G_ema.load_state_dict(ckpt["G_ema_state"])
+The implementation is self-contained PyTorch code.  It keeps the public names
+used by the original baseline package (`Generator`, `Discriminator`, `EMA`) so
+the training, sampling, and export scripts can keep the same flow.
 """
 from __future__ import annotations
 
@@ -33,10 +17,6 @@ import torch.nn.functional as F
 from torch.nn.utils.parametrizations import spectral_norm as _sn
 
 
-# =============================================================================
-# Config
-# =============================================================================
-
 def _normalize_channels(channels: dict[Any, Any]) -> dict[int, int]:
     return {int(k): int(v) for k, v in channels.items()}
 
@@ -46,23 +26,34 @@ class GeneratorConfig:
     z_dim: int
     resolutions: list[int]
     channels: dict[int, int]
-    norm_type: str = "gn"  # 'gn' or 'in'
-    gn_groups: int = 32
+    w_dim: int = 512
+    mapping_layers: int = 4
+    mapping_lr_mul: float = 0.01
+    use_noise: bool = True
+    # Accepted for backward-compatible config loading; unused by StyleGAN G.
+    norm_type: str | None = None
+    gn_groups: int | None = None
     attention_resolutions: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.resolutions = [int(r) for r in self.resolutions]
         self.channels = _normalize_channels(self.channels)
         self.attention_resolutions = [int(r) for r in self.attention_resolutions]
+        if self.z_dim != 512:
+            raise ValueError(f"Project spec requires z_dim=512, got {self.z_dim}")
+        if self.resolutions[0] != 4:
+            raise ValueError("StyleGAN synthesis must start at 4x4")
+        for prev, cur in zip(self.resolutions, self.resolutions[1:]):
+            if cur != prev * 2:
+                raise ValueError(f"resolutions must double each step, got {prev}->{cur}")
         for r in self.resolutions:
             if r not in self.channels:
                 raise ValueError(f"channels missing entry for resolution {r}")
-        if self.norm_type not in ("gn", "in"):
-            raise ValueError(f"norm_type must be 'gn' or 'in', got {self.norm_type!r}")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "GeneratorConfig":
-        return cls(**d)
+        allowed = cls.__dataclass_fields__.keys()
+        return cls(**{k: v for k, v in d.items() if k in allowed})
 
 
 @dataclass
@@ -71,229 +62,272 @@ class DiscriminatorConfig:
     channels: dict[int, int]
     use_spectral_norm: bool = True
     minibatch_std_group: int = 4
+    # Accepted for backward-compatible config loading; unused by StyleGAN D.
     attention_resolutions: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.resolutions = [int(r) for r in self.resolutions]
         self.channels = _normalize_channels(self.channels)
         self.attention_resolutions = [int(r) for r in self.attention_resolutions]
+        for prev, cur in zip(self.resolutions, self.resolutions[1:]):
+            if cur * 2 != prev:
+                raise ValueError(f"D resolutions must halve each step, got {prev}->{cur}")
         for r in self.resolutions:
             if r not in self.channels:
                 raise ValueError(f"channels missing entry for resolution {r}")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "DiscriminatorConfig":
-        return cls(**d)
-
-
-# =============================================================================
-# Norms
-# =============================================================================
-
-def make_norm(channels: int, norm_type: str, gn_groups: int) -> nn.Module:
-    if norm_type == "gn":
-        groups = min(gn_groups, channels)
-        if channels % groups != 0:
-            groups = channels
-        return nn.GroupNorm(num_groups=groups, num_channels=channels)
-    if norm_type == "in":
-        return nn.InstanceNorm2d(channels, affine=True)
-    raise ValueError(f"Unknown norm_type: {norm_type!r}")
+        allowed = cls.__dataclass_fields__.keys()
+        return cls(**{k: v for k, v in d.items() if k in allowed})
 
 
 def sn(module: nn.Module) -> nn.Module:
     return _sn(module)
 
 
-# =============================================================================
-# Building blocks
-# =============================================================================
+class PixelNorm(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(dim=1, keepdim=True) + 1e-8)
 
-class ResBlockUp(nn.Module):
-    """Pre-activation upsample residual block.
 
-    main: NN-upsample 2× → norm → ReLU → Conv3×3 → norm → ReLU → Conv3×3
-    skip: NN-upsample 2× → Conv1×1 (or Identity if in_ch == out_ch)
-    """
-
-    def __init__(self, in_ch: int, out_ch: int, norm_type: str = "gn", gn_groups: int = 32):
+class EqualLinear(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        *,
+        bias: bool = True,
+        lr_mul: float = 1.0,
+        activation: bool = False,
+    ):
         super().__init__()
-        self.norm1 = make_norm(in_ch, norm_type, gn_groups)
-        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.norm2 = make_norm(out_ch, norm_type, gn_groups)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
-        self.skip = nn.Conv2d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+        self.weight = nn.Parameter(torch.randn(out_dim, in_dim).div_(lr_mul))
+        self.bias = nn.Parameter(torch.zeros(out_dim)) if bias else None
+        self.scale = (1.0 / math.sqrt(in_dim)) * lr_mul
+        self.lr_mul = lr_mul
+        self.activation = activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.interpolate(x, scale_factor=2.0, mode="nearest")
-        h = self.conv1(F.relu(self.norm1(h)))
-        h = self.conv2(F.relu(self.norm2(h)))
-        skip = F.interpolate(x, scale_factor=2.0, mode="nearest")
-        skip = self.skip(skip)
-        return h + skip
+        bias = self.bias * self.lr_mul if self.bias is not None else None
+        x = F.linear(x, self.weight * self.scale, bias)
+        if self.activation:
+            x = F.leaky_relu(x, 0.2) * math.sqrt(2)
+        return x
 
 
-class ResBlockDown(nn.Module):
-    """Pre-activation downsample residual block with Spectral Norm (no norm layer).
-
-    main: leaky_relu → Conv3×3 → leaky_relu → Conv3×3 → AvgPool 2×
-    skip: AvgPool 2× → Conv1×1
-    sum scaled by 1/sqrt(2).
-    """
-
-    def __init__(self, in_ch: int, out_ch: int, use_spectral_norm: bool = True):
+class NoiseInjection(nn.Module):
+    def __init__(self, channels: int):
         super().__init__()
-        wrap = sn if use_spectral_norm else (lambda m: m)
-        self.conv1 = wrap(nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1))
-        self.conv2 = wrap(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
-        self.skip = wrap(nn.Conv2d(in_ch, out_ch, kernel_size=1))
+        self.weight = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(F.leaky_relu(x, 0.2))
-        h = self.conv2(F.leaky_relu(h, 0.2))
-        h = F.avg_pool2d(h, 2)
-        skip = F.avg_pool2d(self.skip(x), 2)
-        return (h + skip) / math.sqrt(2)
+        if self.training:
+            noise = torch.randn(x.size(0), 1, x.size(2), x.size(3), device=x.device, dtype=x.dtype)
+            return x + self.weight * noise
+        return x
 
 
-class MinibatchStd(nn.Module):
-    """Append per-group standard-deviation feature channel."""
-
-    def __init__(self, group_size: int = 4):
+class StyledConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, w_dim: int, *, upsample: bool = False, use_noise: bool = True):
         super().__init__()
-        self.group_size = group_size
+        self.upsample = upsample
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size, padding=kernel_size // 2)
+        self.style = EqualLinear(w_dim, out_ch * 2, bias=True)
+        nn.init.zeros_(self.style.bias)
+        self.noise = NoiseInjection(out_ch) if use_noise else nn.Identity()
+        self.bias = nn.Parameter(torch.zeros(1, out_ch, 1, 1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        g = min(self.group_size, B)
-        if B % g != 0:
-            g = B
-        y = x.view(g, B // g, C, H, W)
-        y = y - y.mean(dim=0, keepdim=True)
-        y = (y.pow(2).mean(dim=0) + 1e-8).sqrt()
-        y = y.mean(dim=[1, 2, 3], keepdim=True)
-        y = y.repeat(g, 1, H, W)
-        return torch.cat([x, y], dim=1)
+    def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        if self.upsample:
+            x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+        x = self.conv(x)
+        style = self.style(w).view(w.size(0), 2, x.size(1), 1, 1)
+        scale = style[:, 0] + 1.0
+        shift = style[:, 1]
+        mean = x.mean(dim=[2, 3], keepdim=True)
+        std = torch.rsqrt((x - mean).pow(2).mean(dim=[2, 3], keepdim=True) + 1e-8)
+        x = (x - mean) * std
+        x = x * scale + shift
+        x = self.noise(x)
+        return F.leaky_relu(x + self.bias, 0.2) * math.sqrt(2)
 
 
-class SelfAttention2d(nn.Module):
-    """SAGAN-style 2D self-attention with learnable γ (init 0)."""
-
-    def __init__(self, channels: int, use_spectral_norm: bool = False):
+class ToRGB(nn.Module):
+    def __init__(self, in_ch: int, w_dim: int):
         super().__init__()
-        if channels < 8:
-            raise ValueError(f"SelfAttention2d requires channels>=8, got {channels}")
-        wrap = sn if use_spectral_norm else (lambda m: m)
-        cs = channels // 8
-        cm = channels // 2
-        self.theta = wrap(nn.Conv2d(channels, cs, kernel_size=1, bias=False))
-        self.phi = wrap(nn.Conv2d(channels, cs, kernel_size=1, bias=False))
-        self.g = wrap(nn.Conv2d(channels, cm, kernel_size=1, bias=False))
-        self.o = wrap(nn.Conv2d(cm, channels, kernel_size=1, bias=False))
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.conv = nn.Conv2d(in_ch, 3, 1)
+        self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        N = H * W
-        theta = self.theta(x).view(B, -1, N)
-        phi = F.max_pool2d(self.phi(x), 2).view(B, -1, N // 4)
-        attn = F.softmax(torch.bmm(theta.transpose(1, 2), phi), dim=-1)
-        g = F.max_pool2d(self.g(x), 2).view(B, -1, N // 4)
-        y = torch.bmm(g, attn.transpose(1, 2)).view(B, -1, H, W)
-        return self.gamma * self.o(y) + x
+    def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        del w
+        return self.conv(x) + self.bias
 
 
-# =============================================================================
-# Generator / Discriminator
-# =============================================================================
+class SynthesisBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, w_dim: int, *, is_first: bool, use_noise: bool):
+        super().__init__()
+        self.is_first = is_first
+        self.conv0 = StyledConv(in_ch, out_ch, 3, w_dim, upsample=not is_first, use_noise=use_noise)
+        self.conv1 = StyledConv(out_ch, out_ch, 3, w_dim, upsample=False, use_noise=use_noise)
+        self.to_rgb = ToRGB(out_ch, w_dim)
+
+    def forward(self, x: torch.Tensor, img: torch.Tensor | None, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.conv0(x, w)
+        x = self.conv1(x, w)
+        y = self.to_rgb(x, w)
+        if img is not None:
+            img = F.interpolate(img, scale_factor=2.0, mode="bilinear", align_corners=False)
+            y = y + img
+        return x, y
+
 
 class Generator(nn.Module):
-    """Config-driven ResNet upsample stack: z → 4×4 → ... → R×R."""
+    """StyleGAN-like synthesis network: z -> mapping -> styled conv stack."""
 
     def __init__(self, cfg: GeneratorConfig):
         super().__init__()
         self.cfg = cfg
         self.z_dim = cfg.z_dim
+        self.w_dim = cfg.w_dim
+
+        mapping: list[nn.Module] = [PixelNorm()]
+        for i in range(cfg.mapping_layers):
+            in_dim = cfg.z_dim if i == 0 else cfg.w_dim
+            mapping.append(
+                EqualLinear(
+                    in_dim,
+                    cfg.w_dim,
+                    lr_mul=cfg.mapping_lr_mul,
+                    activation=True,
+                )
+            )
+        self.mapping = nn.Sequential(*mapping)
 
         first_res = cfg.resolutions[0]
         first_ch = cfg.channels[first_res]
-        self.first_res = first_res
-        self.first_ch = first_ch
+        self.input = nn.Parameter(torch.randn(1, first_ch, first_res, first_res))
 
-        self.input_proj = nn.Linear(cfg.z_dim, first_ch * first_res * first_res)
-
-        stages: list[nn.Module] = []
-        for i in range(1, len(cfg.resolutions)):
-            res_out = cfg.resolutions[i]
-            in_ch = cfg.channels[cfg.resolutions[i - 1]]
-            out_ch = cfg.channels[res_out]
-            stages.append(
-                ResBlockUp(in_ch, out_ch, norm_type=cfg.norm_type, gn_groups=cfg.gn_groups)
+        blocks: list[nn.Module] = []
+        in_ch = first_ch
+        for i, res in enumerate(cfg.resolutions):
+            out_ch = cfg.channels[res]
+            blocks.append(
+                SynthesisBlock(
+                    in_ch,
+                    out_ch,
+                    cfg.w_dim,
+                    is_first=i == 0,
+                    use_noise=cfg.use_noise,
+                )
             )
-            if res_out in cfg.attention_resolutions:
-                stages.append(SelfAttention2d(out_ch, use_spectral_norm=False))
-        self.stages = nn.Sequential(*stages)
-
-        last_ch = cfg.channels[cfg.resolutions[-1]]
-        self.out_norm = make_norm(last_ch, cfg.norm_type, cfg.gn_groups)
-        self.to_rgb = nn.Conv2d(last_ch, 3, kernel_size=3, padding=1)
+            in_ch = out_ch
+        self.blocks = nn.ModuleList(blocks)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        h = self.input_proj(z).view(-1, self.first_ch, self.first_res, self.first_res)
-        h = self.stages(h)
-        h = F.relu(self.out_norm(h))
-        return torch.tanh(self.to_rgb(h))
+        w = self.mapping(z)
+        x = self.input.repeat(z.size(0), 1, 1, 1)
+        img = None
+        for block in self.blocks:
+            x, img = block(x, img, w)
+        return torch.tanh(img)
+
+
+class ConvLayer(nn.Module):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int,
+        *,
+        downsample: bool = False,
+        use_spectral_norm: bool = True,
+        activate: bool = True,
+    ):
+        super().__init__()
+        self.downsample = downsample
+        padding = kernel_size // 2
+        conv = nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding)
+        self.conv = sn(conv) if use_spectral_norm else conv
+        self.activate = activate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+        if self.activate:
+            x = F.leaky_relu(x, 0.2) * math.sqrt(2)
+        if self.downsample:
+            x = F.avg_pool2d(x, 2)
+        return x
+
+
+class DiscriminatorBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, *, use_spectral_norm: bool):
+        super().__init__()
+        self.conv0 = ConvLayer(in_ch, in_ch, 3, use_spectral_norm=use_spectral_norm)
+        self.conv1 = ConvLayer(in_ch, out_ch, 3, downsample=True, use_spectral_norm=use_spectral_norm)
+        skip = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.skip = sn(skip) if use_spectral_norm else skip
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(self.conv0(x))
+        s = F.avg_pool2d(self.skip(x), 2)
+        return (h + s) / math.sqrt(2)
+
+
+class MinibatchStd(nn.Module):
+    def __init__(self, group_size: int = 4):
+        super().__init__()
+        self.group_size = group_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        g = min(self.group_size, b)
+        if b % g != 0:
+            g = b
+        y = x.view(g, b // g, c, h, w)
+        y = y - y.mean(dim=0, keepdim=True)
+        y = (y.pow(2).mean(dim=0) + 1e-8).sqrt()
+        y = y.mean(dim=[1, 2, 3], keepdim=True)
+        y = y.repeat(g, 1, h, w)
+        return torch.cat([x, y], dim=1)
 
 
 class Discriminator(nn.Module):
-    """Config-driven ResNet downsample stack with SN + optional SA."""
+    """StyleGAN2-like residual discriminator trained jointly with G."""
 
     def __init__(self, cfg: DiscriminatorConfig):
         super().__init__()
         self.cfg = cfg
         wrap = sn if cfg.use_spectral_norm else (lambda m: m)
 
-        first_res = cfg.resolutions[0]
-        first_ch = cfg.channels[first_res]
-        self.from_rgb = wrap(nn.Conv2d(3, first_ch, kernel_size=3, padding=1))
-
-        stages: list[nn.Module] = []
-        for i in range(1, len(cfg.resolutions)):
-            res_out = cfg.resolutions[i]
-            in_ch = cfg.channels[cfg.resolutions[i - 1]]
-            out_ch = cfg.channels[res_out]
-            stages.append(ResBlockDown(in_ch, out_ch, use_spectral_norm=cfg.use_spectral_norm))
-            if res_out in cfg.attention_resolutions:
-                stages.append(
-                    SelfAttention2d(out_ch, use_spectral_norm=cfg.use_spectral_norm)
+        self.from_rgb = wrap(nn.Conv2d(3, cfg.channels[cfg.resolutions[0]], 1))
+        blocks: list[nn.Module] = []
+        for res_in, res_out in zip(cfg.resolutions, cfg.resolutions[1:]):
+            blocks.append(
+                DiscriminatorBlock(
+                    cfg.channels[res_in],
+                    cfg.channels[res_out],
+                    use_spectral_norm=cfg.use_spectral_norm,
                 )
-        self.stages = nn.Sequential(*stages)
+            )
+        self.blocks = nn.Sequential(*blocks)
 
         last_res = cfg.resolutions[-1]
         last_ch = cfg.channels[last_res]
         self.minibatch_std = MinibatchStd(group_size=cfg.minibatch_std_group)
-        self.final_conv = wrap(nn.Conv2d(last_ch + 1, last_ch, kernel_size=3, padding=1))
+        self.final_conv = ConvLayer(last_ch + 1, last_ch, 3, use_spectral_norm=cfg.use_spectral_norm)
         self.final_linear = wrap(nn.Linear(last_ch * last_res * last_res, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.from_rgb(x)
-        h = self.stages(h)
+        h = F.leaky_relu(self.from_rgb(x), 0.2) * math.sqrt(2)
+        h = self.blocks(h)
         h = self.minibatch_std(h)
-        h = F.leaky_relu(self.final_conv(h), 0.2)
-        h = h.flatten(1)
-        return self.final_linear(h)
+        h = self.final_conv(h)
+        return self.final_linear(h.flatten(1))
 
-
-# =============================================================================
-# EMA
-# =============================================================================
 
 class EMA:
-    """Exponential moving average of Generator weights.
-
-    decay = 0.5 ** (batch_size / half_life). Call `update(G, batch_size)` after
-    every G step. The shadow copy is `.eval()` with grad disabled.
-    """
+    """Exponential moving average of Generator weights."""
 
     def __init__(self, G: nn.Module, half_life: int = 10_000):
         self.shadow = copy.deepcopy(G).eval()
@@ -316,44 +350,53 @@ class EMA:
         self.shadow.load_state_dict(state)
 
 
-# =============================================================================
-# Factories — instantiate the distributed 256 baseline
-# =============================================================================
-
-BASELINE_256_GENERATOR_CONFIG = GeneratorConfig(
+STYLEGAN_1024_GENERATOR_CONFIG = GeneratorConfig(
     z_dim=512,
-    resolutions=[4, 8, 16, 32, 64, 128, 256],
-    channels={4: 512, 8: 512, 16: 512, 32: 512, 64: 256, 128: 128, 256: 64},
-    norm_type="gn",
-    gn_groups=32,
-    attention_resolutions=[32],
+    resolutions=[4, 8, 16, 32, 64, 128, 256, 512, 1024],
+    channels={4: 512, 8: 512, 16: 512, 32: 512, 64: 256, 128: 128, 256: 96, 512: 64, 1024: 32},
+    w_dim=512,
+    mapping_layers=4,
+    mapping_lr_mul=0.01,
+    use_noise=True,
 )
 
-BASELINE_256_DISCRIMINATOR_CONFIG = DiscriminatorConfig(
-    resolutions=[256, 128, 64, 32, 16, 8, 4],
-    channels={256: 64, 128: 128, 64: 256, 32: 512, 16: 512, 8: 512, 4: 512},
+STYLEGAN_1024_DISCRIMINATOR_CONFIG = DiscriminatorConfig(
+    resolutions=[1024, 512, 256, 128, 64, 32, 16, 8, 4],
+    channels={1024: 32, 512: 64, 256: 96, 128: 128, 64: 256, 32: 512, 16: 512, 8: 512, 4: 512},
     use_spectral_norm=True,
     minibatch_std_group=4,
-    attention_resolutions=[32],
 )
+
+
+def build_stylegan_1024_generator() -> Generator:
+    return Generator(STYLEGAN_1024_GENERATOR_CONFIG)
+
+
+def build_stylegan_1024_discriminator() -> Discriminator:
+    return Discriminator(STYLEGAN_1024_DISCRIMINATOR_CONFIG)
+
+
+# Backward-compatible names used by older scripts/checkpoints in this package.
+BASELINE_256_GENERATOR_CONFIG = STYLEGAN_1024_GENERATOR_CONFIG
+BASELINE_256_DISCRIMINATOR_CONFIG = STYLEGAN_1024_DISCRIMINATOR_CONFIG
 
 
 def build_baseline_256_generator() -> Generator:
-    return Generator(BASELINE_256_GENERATOR_CONFIG)
+    return build_stylegan_1024_generator()
 
 
 def build_baseline_256_discriminator() -> Discriminator:
-    return Discriminator(BASELINE_256_DISCRIMINATOR_CONFIG)
+    return build_stylegan_1024_discriminator()
 
 
 if __name__ == "__main__":
-    G = build_baseline_256_generator()
-    D = build_baseline_256_discriminator()
+    G = build_stylegan_1024_generator()
+    D = build_stylegan_1024_discriminator()
     n_g = sum(p.numel() for p in G.parameters())
     n_d = sum(p.numel() for p in D.parameters())
     print(f"Generator: {n_g/1e6:.2f}M params")
     print(f"Discriminator: {n_d/1e6:.2f}M params")
-    z = torch.randn(2, G.z_dim)
+    z = torch.randn(1, G.z_dim)
     fake = G(z)
     score = D(fake)
     print(f"G(z) shape: {tuple(fake.shape)}, range [{fake.min():.3f}, {fake.max():.3f}]")

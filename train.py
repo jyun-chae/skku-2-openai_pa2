@@ -83,6 +83,10 @@ def async_save_checkpoint(path: Path, state: dict) -> threading.Thread:
     return t
 
 
+def prune_finished_threads(threads: list[threading.Thread]) -> list[threading.Thread]:
+    return [t for t in threads if t.is_alive()]
+
+
 @torch.no_grad()
 def save_sample_grid(G: torch.nn.Module, sample_z: torch.Tensor, out_path: Path, nrow: int = 8) -> None:
     G.eval()
@@ -128,6 +132,18 @@ def build_checkpoint(
     }
 
 
+def load_matching_state(module: torch.nn.Module, state: dict, label: str) -> int:
+    current = module.state_dict()
+    matched = {
+        k: v for k, v in state.items()
+        if k in current and current[k].shape == v.shape
+    }
+    current.update(matched)
+    module.load_state_dict(current)
+    print(f"  {label}: loaded {len(matched)}/{len(current)} tensors")
+    return len(matched)
+
+
 def init_from_baseline(
     init_path: Path,
     G: torch.nn.Module,
@@ -135,9 +151,7 @@ def init_from_baseline(
     G_ema: EMA,
     device: str,
 ) -> None:
-    """Strict load of G / D / G_ema from a baseline ckpt.
-
-    Works out of the box when your architecture matches the baseline 256.
+    """Load only tensors whose names and shapes match the current stage.
 
     If you scale the architecture (add 512 / 1024 blocks, change channels,
     swap the up-block design, etc.), this will raise — and that's intentional.
@@ -146,12 +160,17 @@ def init_from_baseline(
     last block's shape mismatch) is part of the assignment. Replace this
     function or write your own loader before scaling.
     """
-    print(f"Initializing from baseline: {init_path}")
-    ckpt = torch.load(init_path, map_location=device, weights_only=True)
-    G.load_state_dict(ckpt["G_state"])
-    D.load_state_dict(ckpt["D_state"])
-    G_ema.load_state_dict(ckpt["G_ema_state"])
-    print("  Loaded G, D, G_ema (strict)")
+    print(f"Initializing from checkpoint with matching tensors: {init_path}")
+    ckpt = torch.load(init_path, map_location=device, weights_only=False)
+    total_loaded = 0
+    if "G_state" in ckpt:
+        total_loaded += load_matching_state(G, ckpt["G_state"], "G")
+    if "D_state" in ckpt:
+        total_loaded += load_matching_state(D, ckpt["D_state"], "D")
+    if "G_ema_state" in ckpt:
+        total_loaded += load_matching_state(G_ema.shadow, ckpt["G_ema_state"], "G_ema")
+    if total_loaded == 0:
+        print("  No compatible tensors found; training starts from random init.")
 
 
 def main() -> None:
@@ -169,6 +188,29 @@ def main() -> None:
     )
     parser.add_argument("--total-images", type=int, default=None)
     parser.add_argument(
+        "--train-zip", type=Path, default=None,
+        help="Override training.train_zip, useful for Google Drive paths in Colab.",
+    )
+    parser.add_argument(
+        "--run-dir", type=Path, default=None,
+        help="Override out.run_dir, useful for saving checkpoints directly to Google Drive.",
+    )
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-name", default=None)
+    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
+    parser.add_argument(
+        "--max-steps", type=int, default=None,
+        help="Run at most this many training steps in this invocation, then save latest.pt and exit.",
+    )
+    parser.add_argument(
+        "--max-images", type=int, default=None,
+        help="Run at most this many additional images in this invocation, then save latest.pt and exit.",
+    )
+    parser.add_argument(
+        "--save-every-steps", type=int, default=None,
+        help="Override training.ckpt_every_steps for step-based checkpointing.",
+    )
+    parser.add_argument(
         "--new-wandb-run", action="store_true",
         help="When --resume, start a fresh wandb run instead of reattaching.",
     )
@@ -181,6 +223,18 @@ def main() -> None:
     train_cfg = cfg["training"]
     if args.total_images is not None:
         train_cfg["total_images"] = args.total_images
+    if args.train_zip is not None:
+        train_cfg["train_zip"] = str(args.train_zip)
+    if args.save_every_steps is not None:
+        train_cfg["ckpt_every_steps"] = args.save_every_steps
+    if args.run_dir is not None:
+        cfg.setdefault("out", {})["run_dir"] = str(args.run_dir)
+    if args.wandb_project is not None:
+        cfg.setdefault("wandb", {})["project"] = args.wandb_project
+    if args.wandb_name is not None:
+        cfg.setdefault("wandb", {})["name"] = args.wandb_name
+    if args.wandb_mode is not None:
+        cfg.setdefault("wandb", {})["mode"] = args.wandb_mode
 
     set_seed(train_cfg["seed"])
     torch.set_float32_matmul_precision("high")
@@ -191,8 +245,12 @@ def main() -> None:
     d_cfg = DiscriminatorConfig.from_dict(cfg["discriminator"])
     G = Generator(g_cfg).to(device)
     D = Discriminator(d_cfg).to(device)
-    print(f"Generator: {sum(p.numel() for p in G.parameters())/1e6:.2f}M params")
-    print(f"Discriminator: {sum(p.numel() for p in D.parameters())/1e6:.2f}M params")
+    g_params = sum(p.numel() for p in G.parameters())
+    d_params = sum(p.numel() for p in D.parameters())
+    print(f"Generator: {g_params/1e6:.2f}M params")
+    print(f"Discriminator: {d_params/1e6:.2f}M params")
+    if g_params >= 50_000_000:
+        raise ValueError(f"Generator must be under 50M parameters, got {g_params:,}")
 
     lr_g = float(train_cfg.get("lr_g", train_cfg.get("lr")))
     lr_d = float(train_cfg.get("lr_d", train_cfg.get("lr")))
@@ -283,6 +341,10 @@ def main() -> None:
             init_kwargs["resume"] = "must"
         run = wandb.init(**init_kwargs)
         wandb_run_id = run.id
+        run.summary["params/G"] = g_params
+        run.summary["params/D"] = d_params
+        run.summary["training/resolution"] = train_cfg.get("resolution")
+        run.summary["training/stage"] = train_cfg.get("stage", train_cfg.get("resolution"))
 
     total_images = train_cfg["total_images"]
     z_dim = g_cfg.z_dim
@@ -290,6 +352,7 @@ def main() -> None:
     r1_lazy_every = train_cfg["r1_lazy_every"]
     log_every = train_cfg["log_every"]
     ckpt_every = train_cfg["ckpt_every"]
+    ckpt_every_steps = int(train_cfg.get("ckpt_every_steps", 0) or 0)
     grad_clip_g = float(train_cfg.get("grad_clip_g", float("inf")))
     grad_clip_d = float(train_cfg.get("grad_clip_d", float("inf")))
     precision = train_cfg.get("precision", "fp32")
@@ -301,7 +364,13 @@ def main() -> None:
     augment_policy = train_cfg.get("augment", "") or ""
     print(f"Augment policy: {augment_policy!r}")
 
+    stop_images = total_images
+    if args.max_images is not None:
+        stop_images = min(stop_images, images_seen + args.max_images)
+    stop_step = None if args.max_steps is None else step + args.max_steps
+
     last_ckpt = images_seen
+    last_ckpt_step = step
     save_threads: list[threading.Thread] = []
     window_t0 = time.perf_counter()
     window_imgs = 0
@@ -312,7 +381,18 @@ def main() -> None:
         f"(batch={train_cfg['batch_size']}, device={device})"
     )
 
+    if args.max_steps is not None or args.max_images is not None:
+        print(
+            "Chunk limit: "
+            f"stop_step={stop_step if stop_step is not None else 'none'}, "
+            f"stop_images={stop_images}"
+        )
+
     while images_seen < total_images:
+        if stop_step is not None and step >= stop_step:
+            break
+        if images_seen >= stop_images:
+            break
         real = next(inf_loader).to(device, non_blocking=True)
         b = real.size(0)
 
@@ -366,6 +446,11 @@ def main() -> None:
             throughput = window_imgs / elapsed
             window_t0 = now
             window_imgs = 0
+            d_real_mean = float(d_real.float().mean().item())
+            d_fake_mean = float(d_fake.float().mean().item())
+            d_fake_g_mean = float(d_fake_g.float().mean().item())
+            fake_for_stats = fake.detach().float()
+            real_for_stats = real.detach().float()
             log = {
                 "images_seen": images_seen,
                 "throughput/imgs_per_sec": throughput,
@@ -373,11 +458,22 @@ def main() -> None:
                 "loss/D_real": float(l_d_real.item()),
                 "loss/D_fake": float(l_d_fake.item()),
                 "loss/G": float(l_g.item()),
-                "D_out/real_mean": float(d_real.float().mean().item()),
-                "D_out/fake_mean": float(d_fake.float().mean().item()),
+                "D_out/real_mean": d_real_mean,
+                "D_out/fake_mean": d_fake_mean,
+                "D_out/fake_for_G_mean": d_fake_g_mean,
+                "score/D_real_fake_gap": d_real_mean - d_fake_mean,
+                "score/G_fooling_logit": d_fake_g_mean,
+                "score/fake_pixel_mean": float(fake_for_stats.mean().item()),
+                "score/fake_pixel_std": float(fake_for_stats.std().item()),
+                "score/fake_pixel_abs_mean": float(fake_for_stats.abs().mean().item()),
+                "score/real_pixel_mean": float(real_for_stats.mean().item()),
+                "score/real_pixel_std": float(real_for_stats.std().item()),
                 "grad_norm/G": grad_norm_g,
                 "grad_norm/D": grad_norm_d,
-                "lr": optG.param_groups[0]["lr"],
+                "lr/G": optG.param_groups[0]["lr"],
+                "lr/D": optD.param_groups[0]["lr"],
+                "params/G_million": g_params / 1e6,
+                "params/D_million": d_params / 1e6,
             }
             if last_r1_value is not None:
                 log["loss/R1"] = last_r1_value
@@ -390,33 +486,55 @@ def main() -> None:
                     f"gn_g={grad_norm_g:.2f} gn_d={grad_norm_d:.2f}"
                 )
 
-        if images_seen - last_ckpt >= ckpt_every:
+        should_save_by_images = images_seen - last_ckpt >= ckpt_every
+        should_save_by_steps = ckpt_every_steps > 0 and step - last_ckpt_step >= ckpt_every_steps
+        if should_save_by_images or should_save_by_steps:
             ckpt = build_checkpoint(
                 images_seen=images_seen, step=step,
                 G=G, D=D, G_ema=G_ema, optG=optG, optD=optD,
                 g_cfg=g_cfg, d_cfg=d_cfg, training_cfg=train_cfg,
                 wandb_run_id=wandb_run_id,
             )
-            ckpt_path = run_dir / f"ckpt_{images_seen:09d}.pt"
+            latest_path = run_dir / "latest.pt"
             grid_path = samples_dir / f"grid_{images_seen:09d}.png"
-            save_threads = [t for t in save_threads if t.is_alive()]
-            save_threads.append(async_save_checkpoint(ckpt_path, ckpt))
+            save_threads = prune_finished_threads(save_threads)
+            saved_names = ["latest.pt"]
+            if should_save_by_images:
+                ckpt_path = run_dir / f"ckpt_{images_seen:09d}.pt"
+                save_threads.append(async_save_checkpoint(ckpt_path, ckpt))
+                saved_names.append(ckpt_path.name)
+            if should_save_by_steps:
+                step_ckpt_path = run_dir / f"ckpt_step_{step:08d}.pt"
+                save_threads.append(async_save_checkpoint(step_ckpt_path, ckpt))
+                saved_names.append(step_ckpt_path.name)
+            save_checkpoint(latest_path, ckpt)
             save_sample_grid(G_ema.shadow, sample_z, grid_path, nrow=8)
             if wandb_mode != "disabled":
                 wandb.log({"samples/grid": wandb.Image(str(grid_path))}, step=step)
-            print(f"[ckpt+grid] {ckpt_path.name} / {grid_path.name}")
+            print(f"[ckpt+grid] {' / '.join(saved_names)} / {grid_path.name}")
             last_ckpt = images_seen
+            last_ckpt_step = step
 
-    print("Training complete. Saving final ckpt...")
-    final_ckpt = build_checkpoint(
+    reached_total = images_seen >= total_images
+    print("Saving latest checkpoint...")
+    latest_ckpt = build_checkpoint(
         images_seen=images_seen, step=step,
         G=G, D=D, G_ema=G_ema, optG=optG, optD=optD,
         g_cfg=g_cfg, d_cfg=d_cfg, training_cfg=train_cfg,
         wandb_run_id=wandb_run_id,
     )
-    save_checkpoint(run_dir / "final.pt", final_ckpt)
     for t in save_threads:
         t.join()
+    save_checkpoint(run_dir / "latest.pt", latest_ckpt)
+    save_checkpoint(run_dir / f"ckpt_step_{step:08d}.pt", latest_ckpt)
+    if reached_total:
+        print("Training complete. Saving final ckpt...")
+        save_checkpoint(run_dir / "final.pt", latest_ckpt)
+    else:
+        print(
+            "Chunk complete. Resume with "
+            f"--resume {run_dir / 'latest.pt'} to continue."
+        )
     if run is not None:
         run.finish()
 

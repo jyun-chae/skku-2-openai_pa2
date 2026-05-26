@@ -43,7 +43,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.model import build_baseline_256_generator
+from src.model import Generator, GeneratorConfig, build_baseline_256_generator
 
 
 TARGET_RESOLUTION = 1024
@@ -99,7 +99,6 @@ def export_to_onnx(
         output_names=["image"],
         opset_version=opset,
         dynamic_axes={"z": {0: "batch"}, "image": {0: "batch"}},
-        dynamo=False,  # legacy tracer — avoids the onnxscript dependency
     )
 
     with torch.no_grad():
@@ -110,10 +109,13 @@ def export_to_onnx(
           f"[{ref_out.min():.3f}, {ref_out.max():.3f}]")
 
 
-def _load_baseline_g(ckpt_path: Path) -> nn.Module:
-    """Load the distributed 256 baseline G (G_ema_state)."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    G = build_baseline_256_generator()
+def _load_generator(ckpt_path: Path) -> nn.Module:
+    """Load G from a training checkpoint, falling back to the package default."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "meta" in ckpt and isinstance(ckpt["meta"], dict) and "generator_config" in ckpt["meta"]:
+        G = Generator(GeneratorConfig.from_dict(ckpt["meta"]["generator_config"]))
+    else:
+        G = build_baseline_256_generator()
     state = ckpt.get("G_ema_state") or ckpt.get("G_state")
     if state is None:
         raise RuntimeError("Checkpoint has neither G_ema_state nor G_state")
@@ -134,7 +136,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     args = parser.parse_args()
 
-    G = _load_baseline_g(args.ckpt)
+    G = _load_generator(args.ckpt)
     export_to_onnx(G, args.out, opset=args.opset, batch_size=args.batch_size)
 
 
