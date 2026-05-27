@@ -438,7 +438,13 @@ def main() -> None:
     fid_real_stats: tuple[np.ndarray, np.ndarray] | None = None
     fid_loader = None
     if fid_every_steps > 0:
-        if _HAS_FID:
+        if not Path(fid_real_path).exists():
+            print(
+                "FID disabled: real image path does not exist: "
+                f"{fid_real_path}. Pass --fid-real-zip or --fid-every-steps 0."
+            )
+            fid_every_steps = 0
+        elif _HAS_FID:
             fid_dataset = ZipImageDataset(fid_real_path, flip=False)
             fid_loader = DataLoader(
                 fid_dataset,
@@ -534,6 +540,13 @@ def main() -> None:
     if precision not in ("bf16", "fp32"):
         raise ValueError(f"precision must be 'bf16' or 'fp32', got {precision!r}")
     use_amp = precision == "bf16"
+    if use_amp and device == "cuda" and not torch.cuda.is_bf16_supported():
+        gpu_name = torch.cuda.get_device_name(0)
+        raise RuntimeError(
+            "BF16 precision is not supported by this CUDA GPU "
+            f"({gpu_name}). Use --precision fp32 with a smaller batch size, "
+            "or switch the Colab runtime to an A100/H100-class GPU."
+        )
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
     print(f"Precision: {precision} ({'autocast bf16' if use_amp else 'fp32 throughout'})")
     augment_policy = train_cfg.get("augment", "") or ""
