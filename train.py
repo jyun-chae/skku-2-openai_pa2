@@ -22,7 +22,7 @@ Recipe (the one that worked after three divergences):
 - fp32 throughout
 
 Logging via wandb if installed and not disabled.
-FID is intentionally not measured here — measure it yourself between checkpoints.
+FID is measured periodically when training.fid_every_steps > 0 and pytorch-fid is installed.
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.utils as vutils
 import yaml
+from scipy import linalg
 from torch.utils.data import DataLoader
 
 # wandb is optional — keep training runnable on environments without it.
@@ -46,6 +47,13 @@ try:
 except ImportError:
     wandb = None
     _HAS_WANDB = False
+
+try:
+    from pytorch_fid.inception import InceptionV3
+    _HAS_FID = True
+except ImportError:
+    InceptionV3 = None
+    _HAS_FID = False
 
 from src.augment import diff_augment
 from src.dataset import ZipImageDataset, infinite_loader
@@ -85,6 +93,105 @@ def async_save_checkpoint(path: Path, state: dict) -> threading.Thread:
 
 def prune_finished_threads(threads: list[threading.Thread]) -> list[threading.Thread]:
     return [t for t in threads if t.is_alive()]
+
+
+def _to_fid_range(x: torch.Tensor) -> torch.Tensor:
+    return ((x.float() + 1.0) / 2.0).clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def _collect_inception_activations(
+    model: torch.nn.Module,
+    batches,
+    *,
+    device: str,
+    max_items: int,
+) -> np.ndarray:
+    activations: list[np.ndarray] = []
+    seen = 0
+    for batch in batches:
+        if seen >= max_items:
+            break
+        batch = batch[: max_items - seen].to(device, non_blocking=True)
+        pred = model(_to_fid_range(batch))[0]
+        if pred.size(2) != 1 or pred.size(3) != 1:
+            pred = F.adaptive_avg_pool2d(pred, output_size=(1, 1))
+        pred = pred.squeeze(3).squeeze(2).cpu().numpy()
+        activations.append(pred)
+        seen += pred.shape[0]
+    if not activations:
+        raise RuntimeError("No images were available for FID calculation.")
+    return np.concatenate(activations, axis=0)
+
+
+def _activation_stats(activations: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return np.mean(activations, axis=0), np.cov(activations, rowvar=False)
+
+
+def _frechet_distance(
+    mu1: np.ndarray,
+    sigma1: np.ndarray,
+    mu2: np.ndarray,
+    sigma2: np.ndarray,
+    eps: float = 1e-6,
+) -> float:
+    diff = mu1 - mu2
+    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2.0 * np.trace(covmean)
+    return float(fid)
+
+
+@torch.no_grad()
+def calculate_fid(
+    G: torch.nn.Module,
+    real_loader: DataLoader,
+    *,
+    z_dim: int,
+    device: str,
+    num_samples: int,
+    batch_size: int,
+    real_stats: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[float, tuple[np.ndarray, np.ndarray]]:
+    if not _HAS_FID:
+        raise RuntimeError("pytorch-fid is not installed. Install it with `pip install pytorch-fid`.")
+
+    dims = 2048
+    block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+    inception = InceptionV3([block_idx]).to(device).eval()
+
+    if real_stats is None:
+        real_acts = _collect_inception_activations(
+            inception,
+            real_loader,
+            device=device,
+            max_items=num_samples,
+        )
+        real_stats = _activation_stats(real_acts)
+
+    G.eval()
+
+    def fake_batches():
+        remaining = num_samples
+        while remaining > 0:
+            current = min(batch_size, remaining)
+            z = torch.randn(current, z_dim, device=device)
+            yield G(z)
+            remaining -= current
+
+    fake_acts = _collect_inception_activations(
+        inception,
+        fake_batches(),
+        device=device,
+        max_items=num_samples,
+    )
+    fake_stats = _activation_stats(fake_acts)
+    fid = _frechet_distance(real_stats[0], real_stats[1], fake_stats[0], fake_stats[1])
+    return fid, real_stats
 
 
 @torch.no_grad()
@@ -226,6 +333,18 @@ def main() -> None:
         "--new-wandb-run", action="store_true",
         help="When --resume, start a fresh wandb run instead of reattaching.",
     )
+    parser.add_argument(
+        "--fid-every-steps", type=int, default=None,
+        help="Override training.fid_every_steps. Set 0 to disable FID.",
+    )
+    parser.add_argument(
+        "--fid-num-samples", type=int, default=None,
+        help="Override training.fid_num_samples.",
+    )
+    parser.add_argument(
+        "--fid-real-zip", type=Path, default=None,
+        help="Override training.fid_real_zip for validation images used as FID real samples.",
+    )
     args = parser.parse_args()
 
     if args.init_from is not None and args.resume is not None:
@@ -245,6 +364,12 @@ def main() -> None:
         train_cfg["num_workers"] = args.num_workers
     if args.precision is not None:
         train_cfg["precision"] = args.precision
+    if args.fid_every_steps is not None:
+        train_cfg["fid_every_steps"] = args.fid_every_steps
+    if args.fid_num_samples is not None:
+        train_cfg["fid_num_samples"] = args.fid_num_samples
+    if args.fid_real_zip is not None:
+        train_cfg["fid_real_zip"] = str(args.fid_real_zip)
     if args.run_dir is not None:
         cfg.setdefault("out", {})["run_dir"] = str(args.run_dir)
     if args.wandb_project is not None:
@@ -305,6 +430,34 @@ def main() -> None:
         drop_last=True,
     )
     inf_loader = infinite_loader(loader)
+
+    fid_every_steps = int(train_cfg.get("fid_every_steps", 0) or 0)
+    fid_num_samples = int(train_cfg.get("fid_num_samples", 5000))
+    fid_batch_size = int(train_cfg.get("fid_batch_size", train_cfg["batch_size"]))
+    fid_real_path = train_cfg.get("fid_real_zip") or train_cfg["train_zip"]
+    fid_real_stats: tuple[np.ndarray, np.ndarray] | None = None
+    fid_loader = None
+    if fid_every_steps > 0:
+        if _HAS_FID:
+            fid_dataset = ZipImageDataset(fid_real_path, flip=False)
+            fid_loader = DataLoader(
+                fid_dataset,
+                batch_size=fid_batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=device == "cuda",
+                persistent_workers=num_workers > 0,
+                prefetch_factor=2 if num_workers > 0 else None,
+                drop_last=False,
+            )
+            print(
+                f"FID: every {fid_every_steps} steps, "
+                f"samples={min(fid_num_samples, len(fid_dataset))}, "
+                f"real={fid_real_path}"
+            )
+        else:
+            print("FID disabled: pytorch-fid is not installed.")
+            fid_every_steps = 0
 
     sample_gen = torch.Generator(device="cpu").manual_seed(train_cfg["sample_seed"])
     sample_z = torch.randn(train_cfg["sample_n"], g_cfg.z_dim, generator=sample_gen).to(device)
@@ -471,6 +624,7 @@ def main() -> None:
             d_real_mean = float(d_real.float().mean().item())
             d_fake_mean = float(d_fake.float().mean().item())
             d_fake_g_mean = float(d_fake_g.float().mean().item())
+            d_real_fake_gap = d_real_mean - d_fake_mean
             fake_for_stats = fake.detach().float()
             real_for_stats = real.detach().float()
             log = {
@@ -483,7 +637,10 @@ def main() -> None:
                 "D_out/real_mean": d_real_mean,
                 "D_out/fake_mean": d_fake_mean,
                 "D_out/fake_for_G_mean": d_fake_g_mean,
-                "score/D_real_fake_gap": d_real_mean - d_fake_mean,
+                "D_real_score": d_real_mean,
+                "D_fake_score": d_fake_mean,
+                "D_real_score_minus_D_fake_score": d_real_fake_gap,
+                "score/D_real_fake_gap": d_real_fake_gap,
                 "score/G_fooling_logit": d_fake_g_mean,
                 "score/fake_pixel_mean": float(fake_for_stats.mean().item()),
                 "score/fake_pixel_std": float(fake_for_stats.std().item()),
@@ -507,6 +664,30 @@ def main() -> None:
                     f"l_d={l_d.item():.3f} l_g={l_g.item():.3f} "
                     f"gn_g={grad_norm_g:.2f} gn_d={grad_norm_d:.2f}"
                 )
+
+        if fid_every_steps > 0 and step % fid_every_steps == 0:
+            assert fid_loader is not None
+            fid_samples = min(fid_num_samples, len(fid_loader.dataset))
+            print(f"Calculating FID at step={step} with {fid_samples} samples...")
+            fid_score, fid_real_stats = calculate_fid(
+                G_ema.shadow,
+                fid_loader,
+                z_dim=z_dim,
+                device=device,
+                num_samples=fid_samples,
+                batch_size=fid_batch_size,
+                real_stats=fid_real_stats,
+            )
+            fid_log = {
+                "FID": fid_score,
+                "fid/score": fid_score,
+                "fid/num_samples": fid_samples,
+                "images_seen": images_seen,
+            }
+            if wandb_mode != "disabled":
+                wandb.log(fid_log, step=step)
+            else:
+                print(f"fid={fid_score:.4f}")
 
         should_save_by_images = images_seen - last_ckpt >= ckpt_every
         should_save_by_steps = ckpt_every_steps > 0 and step - last_ckpt_step >= ckpt_every_steps

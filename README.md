@@ -87,8 +87,9 @@ The training loop keeps the original baseline flow where it is useful:
 - lazy R1 regularization
 - EMA generator
 - checkpoint/resume support
-- WandB logging for losses, discriminator scores, image statistics, gradient
-  norms, throughput, parameter counts, sample grids, and stage metadata
+- WandB logging for losses, discriminator scores, score gaps, FID, image
+  statistics, gradient norms, throughput, parameter counts, sample grids, and
+  stage metadata
 
 WandB is configured separately in each stage config:
 

@@ -57,6 +57,9 @@ training:
   ckpt_every: 100_000
 
   log_every: 50
+  fid_every_steps: 500
+  fid_real_zip: data/valid_10k_256.zip
+  fid_num_samples: 5000
   sample_n: 64
   sample_seed: 12345
   seed: 42
