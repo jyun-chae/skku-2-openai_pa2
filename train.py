@@ -195,9 +195,15 @@ def calculate_fid(
 
 
 @torch.no_grad()
-def save_sample_grid(G: torch.nn.Module, sample_z: torch.Tensor, out_path: Path, nrow: int = 8) -> None:
+def save_sample_grid(
+    G: torch.nn.Module,
+    sample_z: torch.Tensor,
+    out_path: Path,
+    nrow: int = 8,
+    chunk_size: int = 8,
+) -> None:
     G.eval()
-    fake = G(sample_z)
+    fake = torch.cat([G(z) for z in sample_z.split(chunk_size)], dim=0)
     x = ((fake + 1.0) / 2.0).clamp(0.0, 1.0)
     grid = vutils.make_grid(x, nrow=nrow, padding=2)
     vutils.save_image(grid, out_path)
@@ -694,9 +700,6 @@ def main() -> None:
                 "D_out/real_mean": d_real_mean_log,
                 "D_out/fake_mean": d_fake_mean_log,
                 "D_out/fake_for_G_mean": d_fake_g_mean_log,
-                "D_real_score": d_real_mean_log,
-                "D_fake_score": d_fake_mean_log,
-                "D_real_score_minus_D_fake_score": d_real_fake_gap,
                 "score/D_real_fake_gap": d_real_fake_gap,
                 "score/G_fooling_logit": d_fake_g_mean_log,
                 "score/fake_pixel_mean": float(fake_for_stats.mean().item()),
