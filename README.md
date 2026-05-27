@@ -59,11 +59,25 @@ You can override the step save interval from the command line:
 python train.py --config configs/stylegan_256.yaml --max-steps 2000 --save-every-steps 250
 ```
 
-The three configs use matching low-resolution generator blocks, so each stage
-can reuse the earlier stage's mapping network and synthesis blocks.  Newly
-introduced high-resolution blocks start from random initialization.  The
-discriminator is also partially loaded where tensor shapes match, but it is
-expected to adapt more heavily at each new resolution.
+The default stage configs are tuned for an A100-class Colab runtime with BF16:
+
+```text
+256: batch 64, workers 8
+512: batch 24, workers 8
+1024: batch 8, workers 6
+```
+
+On smaller Colab GPUs, lower the batch size from the config default:
+
+```bash
+python train.py --config configs/stylegan_256.yaml --batch-size 8 --num-workers 2 --max-steps 2000
+```
+
+The three configs instantiate the same full 1024 generator/discriminator and
+train only the active prefix/suffix for the selected stage resolution.  This
+keeps parameter names stable across 256 -> 512 -> 1024 training while leaving
+newly activated high-resolution blocks at their saved initialization until
+their stage begins.
 
 The training loop keeps the original baseline flow where it is useful:
 

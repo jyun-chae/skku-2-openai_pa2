@@ -190,6 +190,7 @@ class Generator(nn.Module):
         self.cfg = cfg
         self.z_dim = cfg.z_dim
         self.w_dim = cfg.w_dim
+        self.active_resolution = cfg.resolutions[-1]
 
         mapping: list[nn.Module] = [PixelNorm()]
         for i in range(cfg.mapping_layers):
@@ -224,11 +225,18 @@ class Generator(nn.Module):
             in_ch = out_ch
         self.blocks = nn.ModuleList(blocks)
 
+    def set_active_resolution(self, resolution: int) -> None:
+        resolution = int(resolution)
+        if resolution not in self.cfg.resolutions:
+            raise ValueError(f"active resolution {resolution} is not in {self.cfg.resolutions}")
+        self.active_resolution = resolution
+
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         w = self.mapping(z)
         x = self.input.repeat(z.size(0), 1, 1, 1)
         img = None
-        for block in self.blocks:
+        n_blocks = self.cfg.resolutions.index(self.active_resolution) + 1
+        for block in self.blocks[:n_blocks]:
             x, img = block(x, img, w)
         return torch.tanh(img)
 
@@ -298,19 +306,21 @@ class Discriminator(nn.Module):
     def __init__(self, cfg: DiscriminatorConfig):
         super().__init__()
         self.cfg = cfg
+        self.active_resolution = cfg.resolutions[0]
         wrap = sn if cfg.use_spectral_norm else (lambda m: m)
 
-        self.from_rgb = wrap(nn.Conv2d(3, cfg.channels[cfg.resolutions[0]], 1))
-        blocks: list[nn.Module] = []
+        self.from_rgb = nn.ModuleDict({
+            str(res): wrap(nn.Conv2d(3, cfg.channels[res], 1))
+            for res in cfg.resolutions[:-1]
+        })
+        blocks: dict[str, nn.Module] = {}
         for res_in, res_out in zip(cfg.resolutions, cfg.resolutions[1:]):
-            blocks.append(
-                DiscriminatorBlock(
+            blocks[str(res_in)] = DiscriminatorBlock(
                     cfg.channels[res_in],
                     cfg.channels[res_out],
                     use_spectral_norm=cfg.use_spectral_norm,
-                )
             )
-        self.blocks = nn.Sequential(*blocks)
+        self.blocks = nn.ModuleDict(blocks)
 
         last_res = cfg.resolutions[-1]
         last_ch = cfg.channels[last_res]
@@ -318,9 +328,19 @@ class Discriminator(nn.Module):
         self.final_conv = ConvLayer(last_ch + 1, last_ch, 3, use_spectral_norm=cfg.use_spectral_norm)
         self.final_linear = wrap(nn.Linear(last_ch * last_res * last_res, 1))
 
+    def set_active_resolution(self, resolution: int) -> None:
+        resolution = int(resolution)
+        if resolution not in self.cfg.resolutions:
+            raise ValueError(f"active resolution {resolution} is not in {self.cfg.resolutions}")
+        if resolution == self.cfg.resolutions[-1]:
+            raise ValueError("Discriminator active resolution must be larger than the final 4x4 block")
+        self.active_resolution = resolution
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.leaky_relu(self.from_rgb(x), 0.2) * math.sqrt(2)
-        h = self.blocks(h)
+        h = F.leaky_relu(self.from_rgb[str(self.active_resolution)](x), 0.2) * math.sqrt(2)
+        start = self.cfg.resolutions.index(self.active_resolution)
+        for res in self.cfg.resolutions[start:-1]:
+            h = self.blocks[str(res)](h)
         h = self.minibatch_std(h)
         h = self.final_conv(h)
         return self.final_linear(h.flatten(1))

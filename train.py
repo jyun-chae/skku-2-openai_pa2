@@ -211,6 +211,18 @@ def main() -> None:
         help="Override training.ckpt_every_steps for step-based checkpointing.",
     )
     parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Override training.batch_size, useful when Colab GPU memory is limited.",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=None,
+        help="Override training.num_workers for the DataLoader.",
+    )
+    parser.add_argument(
+        "--precision", choices=["bf16", "fp32"], default=None,
+        help="Override training.precision.",
+    )
+    parser.add_argument(
         "--new-wandb-run", action="store_true",
         help="When --resume, start a fresh wandb run instead of reattaching.",
     )
@@ -227,6 +239,12 @@ def main() -> None:
         train_cfg["train_zip"] = str(args.train_zip)
     if args.save_every_steps is not None:
         train_cfg["ckpt_every_steps"] = args.save_every_steps
+    if args.batch_size is not None:
+        train_cfg["batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        train_cfg["num_workers"] = args.num_workers
+    if args.precision is not None:
+        train_cfg["precision"] = args.precision
     if args.run_dir is not None:
         cfg.setdefault("out", {})["run_dir"] = str(args.run_dir)
     if args.wandb_project is not None:
@@ -245,12 +263,16 @@ def main() -> None:
     d_cfg = DiscriminatorConfig.from_dict(cfg["discriminator"])
     G = Generator(g_cfg).to(device)
     D = Discriminator(d_cfg).to(device)
+    stage_resolution = int(train_cfg["resolution"])
+    G.set_active_resolution(stage_resolution)
+    D.set_active_resolution(stage_resolution)
     g_params = sum(p.numel() for p in G.parameters())
     d_params = sum(p.numel() for p in D.parameters())
     print(f"Generator: {g_params/1e6:.2f}M params")
     print(f"Discriminator: {d_params/1e6:.2f}M params")
-    if g_params >= 50_000_000:
-        raise ValueError(f"Generator must be under 50M parameters, got {g_params:,}")
+    print(f"Active training resolution: {stage_resolution}")
+    if g_params >= 40_000_000:
+        raise ValueError(f"Generator must be under 40M parameters, got {g_params:,}")
 
     lr_g = float(train_cfg.get("lr_g", train_cfg.get("lr")))
     lr_d = float(train_cfg.get("lr_d", train_cfg.get("lr")))

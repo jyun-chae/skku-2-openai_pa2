@@ -114,6 +114,9 @@ def _load_generator(ckpt_path: Path) -> nn.Module:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if "meta" in ckpt and isinstance(ckpt["meta"], dict) and "generator_config" in ckpt["meta"]:
         G = Generator(GeneratorConfig.from_dict(ckpt["meta"]["generator_config"]))
+        training_cfg = ckpt["meta"].get("training_config", {})
+        if "resolution" in training_cfg:
+            G.set_active_resolution(int(training_cfg["resolution"]))
     else:
         G = build_baseline_256_generator()
     state = ckpt.get("G_ema_state") or ckpt.get("G_state")

@@ -36,6 +36,9 @@ def load_generator(ckpt_path: Path, device: str, use_ema: bool) -> Generator:
         g_cfg = GeneratorConfig.from_dict(ckpt["meta"]["generator_config"])
         G = Generator(g_cfg).to(device).eval()
         source_note = f"meta.generator_config (z_dim={g_cfg.z_dim}, max_res={g_cfg.resolutions[-1]})"
+        training_cfg = ckpt["meta"].get("training_config", {})
+        if "resolution" in training_cfg:
+            G.set_active_resolution(int(training_cfg["resolution"]))
     else:
         G = build_baseline_256_generator().to(device).eval()
         source_note = "build_baseline_256_generator() (no meta in ckpt)"

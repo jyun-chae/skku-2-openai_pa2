@@ -36,16 +36,16 @@ training:
   # Use only the announced training split. Do not point this at valid/test data.
   train_zip: data/train_50k_1024.zip
   resolution: 1024
-  batch_size: 6
+  batch_size: 8
   total_images: 10_000_000
-  num_workers: 4
+  num_workers: 6
   flip: true
 
-  precision: fp32
+  precision: bf16
   augment: color,translation
 
-  lr_g: 0.001
-  lr_d: 0.001
+  lr_g: 0.0006
+  lr_d: 0.0006
   beta1: 0.0
   beta2: 0.9
   weight_decay: 0.0
