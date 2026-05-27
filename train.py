@@ -189,7 +189,7 @@ def main() -> None:
     parser.add_argument("--total-images", type=int, default=None)
     parser.add_argument(
         "--train-zip", type=Path, default=None,
-        help="Override training.train_zip, useful for Google Drive paths in Colab.",
+        help="Override training.train_zip with a zip file or extracted image directory.",
     )
     parser.add_argument(
         "--run-dir", type=Path, default=None,
