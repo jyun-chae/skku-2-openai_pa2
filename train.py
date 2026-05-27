@@ -146,6 +146,34 @@ def _frechet_distance(
     return float(fid)
 
 
+def lr_multiplier(step: int, train_cfg: dict) -> float:
+    warmup_steps = int(train_cfg.get("lr_warmup_steps", 0) or 0)
+    decay_start = int(train_cfg.get("lr_decay_start_steps", 0) or 0)
+    decay_steps = int(train_cfg.get("lr_decay_steps", 0) or 0)
+    min_mult = float(train_cfg.get("lr_min_mult", 1.0))
+
+    mult = 1.0
+    if warmup_steps > 0 and step < warmup_steps:
+        mult = max(float(step + 1) / warmup_steps, 1.0 / warmup_steps)
+    if decay_steps > 0 and step >= decay_start:
+        progress = min(max((step - decay_start) / decay_steps, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        mult = min(mult, min_mult + (1.0 - min_mult) * cosine)
+    return float(mult)
+
+
+def set_optimizer_lr(
+    opt: torch.optim.Optimizer,
+    base_lr: float,
+    step: int,
+    train_cfg: dict,
+) -> float:
+    lr = base_lr * lr_multiplier(step, train_cfg)
+    for pg in opt.param_groups:
+        pg["lr"] = lr
+    return lr
+
+
 @torch.no_grad()
 def calculate_fid(
     G: torch.nn.Module,
@@ -423,7 +451,14 @@ def main() -> None:
         betas=(train_cfg["beta1"], train_cfg["beta2"]), eps=1e-8,
         weight_decay=train_cfg["weight_decay"],
     )
-    print(f"Optimizers: G lr={lr_g}, D lr={lr_d}")
+    set_optimizer_lr(optG, lr_g, 0, train_cfg)
+    set_optimizer_lr(optD, lr_d, 0, train_cfg)
+    print(
+        f"Optimizers: G lr={lr_g}, D lr={lr_d}, "
+        f"warmup_steps={int(train_cfg.get('lr_warmup_steps', 0) or 0)}, "
+        f"decay_start_steps={int(train_cfg.get('lr_decay_start_steps', 0) or 0)}, "
+        f"decay_steps={int(train_cfg.get('lr_decay_steps', 0) or 0)}"
+    )
 
     G_ema = EMA(G, half_life=train_cfg["ema_half_life"])
     G_ema.shadow.to(device)
@@ -502,13 +537,10 @@ def main() -> None:
             optG.load_state_dict(ckpt["optG_state"])
         if "optD_state" in ckpt:
             optD.load_state_dict(ckpt["optD_state"])
-        # Force yaml LR onto the loaded optimizer state.
-        for pg in optG.param_groups:
-            pg["lr"] = lr_g
-        for pg in optD.param_groups:
-            pg["lr"] = lr_d
         images_seen = ckpt.get("images_seen", 0)
         step = ckpt.get("step", 0)
+        set_optimizer_lr(optG, lr_g, step, train_cfg)
+        set_optimizer_lr(optD, lr_d, step, train_cfg)
         wandb_run_id = None if args.new_wandb_run else ckpt.get("wandb_run_id")
         rng = ckpt.get("rng_state", {})
         if rng.get("torch") is not None:
@@ -598,6 +630,9 @@ def main() -> None:
             break
         if images_seen >= stop_images:
             break
+        set_optimizer_lr(optG, lr_g, step, train_cfg)
+        set_optimizer_lr(optD, lr_d, step, train_cfg)
+
         # --- D step ---
         optD.zero_grad(set_to_none=True)
         total_b = 0
