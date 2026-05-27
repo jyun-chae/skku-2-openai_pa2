@@ -322,6 +322,10 @@ def main() -> None:
         help="Override training.batch_size, useful when Colab GPU memory is limited.",
     )
     parser.add_argument(
+        "--grad-accum-steps", type=int, default=None,
+        help="Override training.grad_accum_steps. Effective batch is batch_size * grad_accum_steps.",
+    )
+    parser.add_argument(
         "--num-workers", type=int, default=None,
         help="Override training.num_workers for the DataLoader.",
     )
@@ -360,6 +364,8 @@ def main() -> None:
         train_cfg["ckpt_every_steps"] = args.save_every_steps
     if args.batch_size is not None:
         train_cfg["batch_size"] = args.batch_size
+    if args.grad_accum_steps is not None:
+        train_cfg["grad_accum_steps"] = args.grad_accum_steps
     if args.num_workers is not None:
         train_cfg["num_workers"] = args.num_workers
     if args.precision is not None:
@@ -534,6 +540,10 @@ def main() -> None:
     log_every = train_cfg["log_every"]
     ckpt_every = train_cfg["ckpt_every"]
     ckpt_every_steps = int(train_cfg.get("ckpt_every_steps", 0) or 0)
+    grad_accum_steps = int(train_cfg.get("grad_accum_steps", 1) or 1)
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
+    effective_batch_size = int(train_cfg["batch_size"]) * grad_accum_steps
     grad_clip_g = float(train_cfg.get("grad_clip_g", float("inf")))
     grad_clip_d = float(train_cfg.get("grad_clip_d", float("inf")))
     precision = train_cfg.get("precision", "fp32")
@@ -566,7 +576,8 @@ def main() -> None:
 
     print(
         f"Training: images_seen={images_seen} → {total_images} "
-        f"(batch={train_cfg['batch_size']}, device={device})"
+        f"(micro_batch={train_cfg['batch_size']}, accum={grad_accum_steps}, "
+        f"effective_batch={effective_batch_size}, device={device})"
     )
 
     if args.max_steps is not None or args.max_images is not None:
@@ -581,28 +592,57 @@ def main() -> None:
             break
         if images_seen >= stop_images:
             break
-        real = next(inf_loader).to(device, non_blocking=True)
-        b = real.size(0)
-
         # --- D step ---
-        z = torch.randn(b, z_dim, device=device)
-        with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-            with torch.no_grad():
-                fake = G(z)
-            d_real = D(diff_augment(real, augment_policy))
-            d_fake = D(diff_augment(fake.detach(), augment_policy))
-            l_d_real = F.softplus(-d_real).mean()
-            l_d_fake = F.softplus(d_fake).mean()
-            l_d = l_d_real + l_d_fake
         optD.zero_grad(set_to_none=True)
-        l_d.backward()
+        total_b = 0
+        micro_batch_sizes: list[int] = []
+        l_d_real_log = 0.0
+        l_d_fake_log = 0.0
+        l_d_log = 0.0
+        d_real_mean_log = 0.0
+        d_fake_mean_log = 0.0
+        r1_log = 0.0
+        did_r1 = (step + 1) % r1_lazy_every == 0
+        real_for_stats = None
+        fake_for_stats = None
+        for _ in range(grad_accum_steps):
+            real = next(inf_loader).to(device, non_blocking=True)
+            b = real.size(0)
+            total_b += b
+            micro_batch_sizes.append(b)
+            z = torch.randn(b, z_dim, device=device)
+            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                with torch.no_grad():
+                    fake = G(z)
+                d_real = D(diff_augment(real, augment_policy))
+                d_fake = D(diff_augment(fake.detach(), augment_policy))
+                l_d_real = F.softplus(-d_real).mean()
+                l_d_fake = F.softplus(d_fake).mean()
+                l_d = l_d_real + l_d_fake
+            (l_d / grad_accum_steps).backward()
 
-        if (step + 1) % r1_lazy_every == 0:
-            l_r1 = r1_lazy_every * r1_penalty(
-                D, diff_augment(real.float(), augment_policy), gamma=r1_gamma,
-            )
-            l_r1.backward()
-            last_r1_value = float(l_r1.item()) / r1_lazy_every
+            if did_r1:
+                l_r1 = r1_lazy_every * r1_penalty(
+                    D, diff_augment(real.float(), augment_policy), gamma=r1_gamma,
+                )
+                (l_r1 / grad_accum_steps).backward()
+                r1_log += float(l_r1.item()) / r1_lazy_every
+
+            l_d_real_log += float(l_d_real.item())
+            l_d_fake_log += float(l_d_fake.item())
+            l_d_log += float(l_d.item())
+            d_real_mean_log += float(d_real.float().mean().item())
+            d_fake_mean_log += float(d_fake.float().mean().item())
+            real_for_stats = real.detach().float()
+            fake_for_stats = fake.detach().float()
+
+        l_d_real_log /= grad_accum_steps
+        l_d_fake_log /= grad_accum_steps
+        l_d_log /= grad_accum_steps
+        d_real_mean_log /= grad_accum_steps
+        d_fake_mean_log /= grad_accum_steps
+        if did_r1:
+            last_r1_value = r1_log / grad_accum_steps
 
         grad_norm_d = float(
             torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=grad_clip_d)
@@ -610,22 +650,31 @@ def main() -> None:
         optD.step()
 
         # --- G step ---
-        z = torch.randn(b, z_dim, device=device)
-        with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-            fake = G(z)
-            d_fake_g = D(diff_augment(fake, augment_policy))
-            l_g = ns_logistic_g(d_fake_g)
         optG.zero_grad(set_to_none=True)
-        l_g.backward()
+        l_g_log = 0.0
+        d_fake_g_mean_log = 0.0
+        for b in micro_batch_sizes:
+            z = torch.randn(b, z_dim, device=device)
+            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                fake = G(z)
+                d_fake_g = D(diff_augment(fake, augment_policy))
+                l_g = ns_logistic_g(d_fake_g)
+            (l_g / grad_accum_steps).backward()
+            l_g_log += float(l_g.item())
+            d_fake_g_mean_log += float(d_fake_g.float().mean().item())
+            fake_for_stats = fake.detach().float()
+        l_g_log /= grad_accum_steps
+        d_fake_g_mean_log /= grad_accum_steps
+
         grad_norm_g = float(
             torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=grad_clip_g)
         )
         optG.step()
 
-        G_ema.update(G, b)
+        G_ema.update(G, total_b)
 
-        images_seen += b
-        window_imgs += b
+        images_seen += total_b
+        window_imgs += total_b
         step += 1
 
         if step % log_every == 0:
@@ -634,27 +683,22 @@ def main() -> None:
             throughput = window_imgs / elapsed
             window_t0 = now
             window_imgs = 0
-            d_real_mean = float(d_real.float().mean().item())
-            d_fake_mean = float(d_fake.float().mean().item())
-            d_fake_g_mean = float(d_fake_g.float().mean().item())
-            d_real_fake_gap = d_real_mean - d_fake_mean
-            fake_for_stats = fake.detach().float()
-            real_for_stats = real.detach().float()
+            d_real_fake_gap = d_real_mean_log - d_fake_mean_log
             log = {
                 "images_seen": images_seen,
                 "throughput/imgs_per_sec": throughput,
-                "loss/D_total": float(l_d.item()),
-                "loss/D_real": float(l_d_real.item()),
-                "loss/D_fake": float(l_d_fake.item()),
-                "loss/G": float(l_g.item()),
-                "D_out/real_mean": d_real_mean,
-                "D_out/fake_mean": d_fake_mean,
-                "D_out/fake_for_G_mean": d_fake_g_mean,
-                "D_real_score": d_real_mean,
-                "D_fake_score": d_fake_mean,
+                "loss/D_total": l_d_log,
+                "loss/D_real": l_d_real_log,
+                "loss/D_fake": l_d_fake_log,
+                "loss/G": l_g_log,
+                "D_out/real_mean": d_real_mean_log,
+                "D_out/fake_mean": d_fake_mean_log,
+                "D_out/fake_for_G_mean": d_fake_g_mean_log,
+                "D_real_score": d_real_mean_log,
+                "D_fake_score": d_fake_mean_log,
                 "D_real_score_minus_D_fake_score": d_real_fake_gap,
                 "score/D_real_fake_gap": d_real_fake_gap,
-                "score/G_fooling_logit": d_fake_g_mean,
+                "score/G_fooling_logit": d_fake_g_mean_log,
                 "score/fake_pixel_mean": float(fake_for_stats.mean().item()),
                 "score/fake_pixel_std": float(fake_for_stats.std().item()),
                 "score/fake_pixel_abs_mean": float(fake_for_stats.abs().mean().item()),
@@ -674,7 +718,7 @@ def main() -> None:
             else:
                 print(
                     f"step={step} imgs={images_seen} thr={throughput:.1f}img/s "
-                    f"l_d={l_d.item():.3f} l_g={l_g.item():.3f} "
+                    f"l_d={l_d_log:.3f} l_g={l_g_log:.3f} "
                     f"gn_g={grad_norm_g:.2f} gn_d={grad_norm_d:.2f}"
                 )
 
