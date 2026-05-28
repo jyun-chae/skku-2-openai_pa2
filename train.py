@@ -185,6 +185,17 @@ def path_length_regularization(
     return penalty, path_lengths.detach().mean(), next_pl_mean.detach()
 
 
+def ensure_finite(name: str, value: torch.Tensor | float, step: int) -> None:
+    if isinstance(value, torch.Tensor):
+        ok = bool(torch.isfinite(value.detach()).all().item())
+        shown = float(value.detach().float().mean().item()) if value.numel() else float("nan")
+    else:
+        ok = np.isfinite(value)
+        shown = float(value)
+    if not ok:
+        raise FloatingPointError(f"Non-finite {name} at step={step}: {shown}")
+
+
 @torch.no_grad()
 def calculate_fid(
     G: torch.nn.Module,
@@ -707,12 +718,14 @@ def main() -> None:
                 l_d_real = F.softplus(-d_real).mean()
                 l_d_fake = F.softplus(d_fake).mean()
                 l_d = l_d_real + l_d_fake
+            ensure_finite("loss/D", l_d, step)
             (l_d / grad_accum_steps).backward()
 
             if did_r1:
                 l_r1 = r1_lazy_every * r1_penalty(
                     D, diff_augment(real.float(), augment_policy), gamma=r1_gamma,
                 )
+                ensure_finite("loss/R1", l_r1, step)
                 (l_r1 / grad_accum_steps).backward()
                 r1_log += float(l_r1.item()) / r1_lazy_every
 
@@ -733,7 +746,9 @@ def main() -> None:
             last_r1_value = r1_log / grad_accum_steps
 
         grad_norm_d = float(
-            torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=grad_clip_d)
+            torch.nn.utils.clip_grad_norm_(
+                D.parameters(), max_norm=grad_clip_d, error_if_nonfinite=True,
+            )
         )
         optD.step()
 
@@ -748,6 +763,7 @@ def main() -> None:
                 fake = G(z, z2=z2, mixing_prob=style_mixing_prob)
                 d_fake_g = D(diff_augment(fake, augment_policy))
                 l_g = ns_logistic_g(d_fake_g)
+            ensure_finite("loss/G", l_g, step)
             (l_g / grad_accum_steps).backward()
             l_g_log += float(l_g.item())
             d_fake_g_mean_log += float(d_fake_g.float().mean().item())
@@ -762,6 +778,7 @@ def main() -> None:
                     G, z_pl, pl_mean, decay=pl_decay,
                 )
                 l_pl = pl_penalty * pl_weight * pl_every
+            ensure_finite("loss/path_length_reg", l_pl, step)
             l_pl.backward()
             pl_mean = next_pl_mean
             last_pl_value = float(l_pl.item()) / pl_every
@@ -770,7 +787,9 @@ def main() -> None:
         d_fake_g_mean_log /= grad_accum_steps
 
         grad_norm_g = float(
-            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=grad_clip_g)
+            torch.nn.utils.clip_grad_norm_(
+                G.parameters(), max_norm=grad_clip_g, error_if_nonfinite=True,
+            )
         )
         optG.step()
 

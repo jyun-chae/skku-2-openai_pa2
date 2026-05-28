@@ -45,9 +45,9 @@ training:
   precision: bf16
   augment: ""
 
-  lr_g: 0.002
-  lr_d: 0.002
-  lr_warmup_steps: 0
+  lr_g: 0.001
+  lr_d: 0.001
+  lr_warmup_steps: 1000
   lr_decay_start_steps: 0
   lr_decay_steps: 0
   lr_min_mult: 1.0
