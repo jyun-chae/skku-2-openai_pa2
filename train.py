@@ -385,6 +385,18 @@ def main() -> None:
         help="Override training.fid_num_samples.",
     )
     parser.add_argument(
+        "--path-regularize-weight", type=float, default=None,
+        help="Override training.path_regularize_weight. Set 0 to disable path length regularization.",
+    )
+    parser.add_argument(
+        "--path-length-batch-shrink", type=int, default=None,
+        help="Override training.path_length_batch_shrink. Larger values reduce path regularization memory.",
+    )
+    parser.add_argument(
+        "--path-length-lazy-every", type=int, default=None,
+        help="Override training.path_length_lazy_every. Larger values run path regularization less often.",
+    )
+    parser.add_argument(
         "--fid-real-zip", type=Path, default=None,
         help="Override training.fid_real_zip for validation images used as FID real samples.",
     )
@@ -413,6 +425,12 @@ def main() -> None:
         train_cfg["fid_every_steps"] = args.fid_every_steps
     if args.fid_num_samples is not None:
         train_cfg["fid_num_samples"] = args.fid_num_samples
+    if args.path_regularize_weight is not None:
+        train_cfg["path_regularize_weight"] = args.path_regularize_weight
+    if args.path_length_batch_shrink is not None:
+        train_cfg["path_length_batch_shrink"] = args.path_length_batch_shrink
+    if args.path_length_lazy_every is not None:
+        train_cfg["path_length_lazy_every"] = args.path_length_lazy_every
     if args.fid_real_zip is not None:
         train_cfg["fid_real_zip"] = str(args.fid_real_zip)
     if args.run_dir is not None:
