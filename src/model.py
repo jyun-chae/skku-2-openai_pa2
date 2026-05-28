@@ -230,9 +230,8 @@ class Generator(nn.Module):
         if update_w_avg is None:
             update_w_avg = self.training
         if update_w_avg and torch.is_grad_enabled():
-            self.w_avg.copy_(
-                self.w_avg.lerp(w.detach().mean(dim=0), 1.0 - self.cfg.w_avg_beta)
-            )
+            w_avg = w.detach().float().mean(dim=0)
+            self.w_avg.copy_(self.w_avg.lerp(w_avg, 1.0 - self.cfg.w_avg_beta))
         return w
 
     def make_ws(
@@ -256,6 +255,7 @@ class Generator(nn.Module):
             )
         if truncation_psi != 1.0:
             center = self.w_avg if truncation_latent is None else truncation_latent
+            center = center.to(device=ws.device, dtype=ws.dtype)
             ws = center.view(1, 1, -1).lerp(ws, truncation_psi)
         return ws
 
