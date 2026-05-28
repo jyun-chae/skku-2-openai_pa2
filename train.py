@@ -446,6 +446,16 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}", flush=True)
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        print(
+            f"CUDA: {props.name}, capability={props.major}.{props.minor}, "
+            f"total={total_bytes / 1024**3:.2f}GiB, free={free_bytes / 1024**3:.2f}GiB, "
+            f"bf16_supported={torch.cuda.is_bf16_supported()}",
+            flush=True,
+        )
 
     g_cfg = GeneratorConfig.from_dict(cfg["generator"])
     d_cfg = DiscriminatorConfig.from_dict(cfg["discriminator"])
