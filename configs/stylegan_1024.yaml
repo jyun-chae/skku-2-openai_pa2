@@ -46,8 +46,8 @@ training:
   augment: ""
 
   lr_g: 0.001
-  lr_d: 0.001
-  lr_warmup_steps: 1000
+  lr_d: 0.0005
+  lr_warmup_steps: 2000
   lr_decay_start_steps: 0
   lr_decay_steps: 0
   lr_min_mult: 1.0
@@ -56,7 +56,7 @@ training:
   weight_decay: 0.0
 
   grad_clip_g: 10.0
-  grad_clip_d: 100.0
+  grad_clip_d: 10.0
 
   r1_gamma: 10.0
   r1_lazy_every: 16
@@ -67,6 +67,7 @@ training:
   path_length_decay: 0.01
   path_length_batch_shrink: 2
   path_length_lazy_every: 4
+  path_regularize_start_steps: 2000
 
   ema_kimg: 10
   ema_rampup: 0.05

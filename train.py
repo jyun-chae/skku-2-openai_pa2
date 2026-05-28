@@ -408,6 +408,10 @@ def main() -> None:
         help="Override training.path_length_lazy_every. Larger values run path regularization less often.",
     )
     parser.add_argument(
+        "--path-regularize-start-steps", type=int, default=None,
+        help="Override training.path_regularize_start_steps. Delays path length regularization.",
+    )
+    parser.add_argument(
         "--fid-real-zip", type=Path, default=None,
         help="Override training.fid_real_zip for validation images used as FID real samples.",
     )
@@ -442,6 +446,8 @@ def main() -> None:
         train_cfg["path_length_batch_shrink"] = args.path_length_batch_shrink
     if args.path_length_lazy_every is not None:
         train_cfg["path_length_lazy_every"] = args.path_length_lazy_every
+    if args.path_regularize_start_steps is not None:
+        train_cfg["path_regularize_start_steps"] = args.path_regularize_start_steps
     if args.fid_real_zip is not None:
         train_cfg["fid_real_zip"] = str(args.fid_real_zip)
     if args.run_dir is not None:
@@ -631,6 +637,7 @@ def main() -> None:
     pl_decay = float(train_cfg.get("path_length_decay", 0.01))
     pl_shrink = max(1, int(train_cfg.get("path_length_batch_shrink", 2)))
     pl_every = max(1, int(train_cfg.get("path_length_lazy_every", 4)))
+    pl_start_steps = max(0, int(train_cfg.get("path_regularize_start_steps", 0) or 0))
     log_every = train_cfg["log_every"]
     ckpt_every = train_cfg["ckpt_every"]
     ckpt_every_steps = int(train_cfg.get("ckpt_every_steps", 0) or 0)
@@ -769,7 +776,7 @@ def main() -> None:
             d_fake_g_mean_log += float(d_fake_g.float().mean().item())
             fake_for_stats = fake.detach().float()
 
-        did_pl = pl_weight > 0.0 and (step + 1) % pl_every == 0
+        did_pl = pl_weight > 0.0 and step >= pl_start_steps and (step + 1) % pl_every == 0
         if did_pl:
             pl_batch = max(1, micro_batch_sizes[0] // pl_shrink)
             z_pl = torch.randn(pl_batch, z_dim, device=device)
