@@ -83,12 +83,14 @@ keeps parameter names stable across 256 -> 512 -> 1024 training while leaving
 newly activated high-resolution blocks at their saved initialization until
 their stage begins.
 
-The training loop keeps the original baseline flow where it is useful:
+The training loop uses a compact StyleGAN2-style recipe:
 
 - zip-backed dataset loader
-- DiffAugment `color,translation`
+- horizontal flip by default; DiffAugment `color`/`translation` remains optional
 - non-saturating logistic GAN loss
 - lazy R1 regularization
+- lazy path length regularization
+- StyleGAN2-style style mixing
 - EMA generator
 - checkpoint/resume support
 - WandB logging for losses, discriminator scores, score gaps, FID, image
@@ -113,11 +115,11 @@ Set `mode: offline` or `mode: disabled` if needed.
 Generator:
 
 - input: `(B, 512)` Gaussian noise
-- mapping network: 4-layer MLP from `z` to `w`
-- synthesis: learned 4x4 constant, styled convolutions with AdaIN, per-layer
-  noise injection, skip ToRGB outputs
+- mapping network: 8-layer MLP from `z` to `w`
+- synthesis: learned 4x4 constant, per-layer `w+` styles, styled convolutions
+  with AdaIN, per-layer noise injection, skip ToRGB outputs
 - output: `(B, 3, 1024, 1024)` in `[-1, 1]`
-- parameter count: about 27.87M at the 1024 stage, under the 50M hard threshold
+- parameter count: about 39.87M at the 1024 stage, under the 40M hard threshold
 
 Discriminator:
 
@@ -133,7 +135,9 @@ python generate.py --ckpt runs/stylegan_1024/final.pt --out samples/grid.png --n
 ```
 
 `generate.py` reads `meta.generator_config` from checkpoints saved by
-`train.py`, so it reconstructs the trained architecture automatically.
+`train.py`, so it reconstructs the trained architecture automatically. Use
+`--truncation-psi 0.7` or another value below 1.0 to apply inference-only
+truncation.
 
 ## Export ONNX
 

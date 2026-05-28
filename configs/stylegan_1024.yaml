@@ -2,19 +2,20 @@ generator:
   z_dim: 512
   resolutions: [4, 8, 16, 32, 64, 128, 256, 512, 1024]
   channels:
-    4: 608
-    8: 608
-    16: 608
-    32: 608
+    4: 600
+    8: 600
+    16: 600
+    32: 600
     64: 352
     128: 224
     256: 160
     512: 96
     1024: 64
   w_dim: 512
-  mapping_layers: 4
+  mapping_layers: 8
   mapping_lr_mul: 0.01
   use_noise: true
+  w_avg_beta: 0.995
 
 discriminator:
   resolutions: [1024, 512, 256, 128, 64, 32, 16, 8, 4]
@@ -42,12 +43,16 @@ training:
   flip: true
 
   precision: bf16
-  augment: color,translation
+  augment: ""
 
-  lr_g: 0.0006
-  lr_d: 0.0006
+  lr_g: 0.002
+  lr_d: 0.002
+  lr_warmup_steps: 0
+  lr_decay_start_steps: 0
+  lr_decay_steps: 0
+  lr_min_mult: 1.0
   beta1: 0.0
-  beta2: 0.9
+  beta2: 0.99
   weight_decay: 0.0
 
   grad_clip_g: 10.0
@@ -56,7 +61,15 @@ training:
   r1_gamma: 10.0
   r1_lazy_every: 16
 
-  ema_half_life: 10_000
+  style_mixing_prob: 0.9
+
+  path_regularize_weight: 2.0
+  path_length_decay: 0.01
+  path_length_batch_shrink: 2
+  path_length_lazy_every: 4
+
+  ema_kimg: 10
+  ema_rampup: 0.05
 
   ckpt_every: 100_000
   ckpt_every_steps: 500

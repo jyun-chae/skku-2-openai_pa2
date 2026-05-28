@@ -1,14 +1,9 @@
-"""StyleGAN-inspired generator/discriminator for Project 2.
-
-The implementation is self-contained PyTorch code.  It keeps the public names
-used by the original baseline package (`Generator`, `Discriminator`, `EMA`) so
-the training, sampling, and export scripts can keep the same flow.
-"""
+"""StyleGAN2-inspired generator/discriminator for Project 2."""
 from __future__ import annotations
 
 import copy
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -27,18 +22,14 @@ class GeneratorConfig:
     resolutions: list[int]
     channels: dict[int, int]
     w_dim: int = 512
-    mapping_layers: int = 4
+    mapping_layers: int = 8
     mapping_lr_mul: float = 0.01
     use_noise: bool = True
-    # Accepted for backward-compatible config loading; unused by StyleGAN G.
-    norm_type: str | None = None
-    gn_groups: int | None = None
-    attention_resolutions: list[int] = field(default_factory=list)
+    w_avg_beta: float = 0.995
 
     def __post_init__(self) -> None:
         self.resolutions = [int(r) for r in self.resolutions]
         self.channels = _normalize_channels(self.channels)
-        self.attention_resolutions = [int(r) for r in self.attention_resolutions]
         if self.z_dim != 512:
             raise ValueError(f"Project spec requires z_dim=512, got {self.z_dim}")
         if self.resolutions[0] != 4:
@@ -52,8 +43,7 @@ class GeneratorConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "GeneratorConfig":
-        allowed = cls.__dataclass_fields__.keys()
-        return cls(**{k: v for k, v in d.items() if k in allowed})
+        return cls(**d)
 
 
 @dataclass
@@ -62,13 +52,10 @@ class DiscriminatorConfig:
     channels: dict[int, int]
     use_spectral_norm: bool = True
     minibatch_std_group: int = 4
-    # Accepted for backward-compatible config loading; unused by StyleGAN D.
-    attention_resolutions: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.resolutions = [int(r) for r in self.resolutions]
         self.channels = _normalize_channels(self.channels)
-        self.attention_resolutions = [int(r) for r in self.attention_resolutions]
         for prev, cur in zip(self.resolutions, self.resolutions[1:]):
             if cur * 2 != prev:
                 raise ValueError(f"D resolutions must halve each step, got {prev}->{cur}")
@@ -78,8 +65,7 @@ class DiscriminatorConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "DiscriminatorConfig":
-        allowed = cls.__dataclass_fields__.keys()
-        return cls(**{k: v for k, v in d.items() if k in allowed})
+        return cls(**d)
 
 
 def sn(module: nn.Module) -> nn.Module:
@@ -172,10 +158,16 @@ class SynthesisBlock(nn.Module):
         self.conv1 = StyledConv(out_ch, out_ch, 3, w_dim, upsample=False, use_noise=use_noise)
         self.to_rgb = ToRGB(out_ch, w_dim)
 
-    def forward(self, x: torch.Tensor, img: torch.Tensor | None, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.conv0(x, w)
-        x = self.conv1(x, w)
-        y = self.to_rgb(x, w)
+    def forward(
+        self,
+        x: torch.Tensor,
+        img: torch.Tensor | None,
+        w0: torch.Tensor,
+        w1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.conv0(x, w0)
+        x = self.conv1(x, w1)
+        y = self.to_rgb(x, w1)
         if img is not None:
             img = F.interpolate(img, scale_factor=2.0, mode="bilinear", align_corners=False)
             y = y + img
@@ -204,6 +196,7 @@ class Generator(nn.Module):
                 )
             )
         self.mapping = nn.Sequential(*mapping)
+        self.register_buffer("w_avg", torch.zeros(cfg.w_dim))
 
         first_res = cfg.resolutions[0]
         first_ch = cfg.channels[first_res]
@@ -224,6 +217,7 @@ class Generator(nn.Module):
             )
             in_ch = out_ch
         self.blocks = nn.ModuleList(blocks)
+        self.num_ws = len(self.blocks) * 2
 
     def set_active_resolution(self, resolution: int) -> None:
         resolution = int(resolution)
@@ -231,14 +225,71 @@ class Generator(nn.Module):
             raise ValueError(f"active resolution {resolution} is not in {self.cfg.resolutions}")
         self.active_resolution = resolution
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def get_latent(self, z: torch.Tensor, *, update_w_avg: bool | None = None) -> torch.Tensor:
         w = self.mapping(z)
-        x = self.input.repeat(z.size(0), 1, 1, 1)
+        if update_w_avg is None:
+            update_w_avg = self.training
+        if update_w_avg and torch.is_grad_enabled():
+            self.w_avg.copy_(
+                self.w_avg.lerp(w.detach().mean(dim=0), 1.0 - self.cfg.w_avg_beta)
+            )
+        return w
+
+    def make_ws(
+        self,
+        z: torch.Tensor,
+        *,
+        z2: torch.Tensor | None = None,
+        mixing_prob: float = 0.0,
+        truncation_psi: float = 1.0,
+        truncation_latent: torch.Tensor | None = None,
+        update_w_avg: bool | None = None,
+    ) -> torch.Tensor:
+        w = self.get_latent(z, update_w_avg=update_w_avg)
+        ws = w.unsqueeze(1).repeat(1, self.num_ws, 1)
+        if z2 is not None and mixing_prob > 0.0 and torch.rand((), device=z.device) < mixing_prob:
+            w2 = self.get_latent(z2, update_w_avg=False)
+            cutoff = int(torch.randint(1, self.num_ws, (), device=z.device).item())
+            ws = torch.cat(
+                [ws[:, :cutoff], w2.unsqueeze(1).repeat(1, self.num_ws - cutoff, 1)],
+                dim=1,
+            )
+        if truncation_psi != 1.0:
+            center = self.w_avg if truncation_latent is None else truncation_latent
+            ws = center.view(1, 1, -1).lerp(ws, truncation_psi)
+        return ws
+
+    def synthesis(self, ws: torch.Tensor) -> torch.Tensor:
+        x = self.input.repeat(ws.size(0), 1, 1, 1)
         img = None
         n_blocks = self.cfg.resolutions.index(self.active_resolution) + 1
-        for block in self.blocks[:n_blocks]:
-            x, img = block(x, img, w)
+        for i, block in enumerate(self.blocks[:n_blocks]):
+            x, img = block(x, img, ws[:, 2 * i], ws[:, 2 * i + 1])
         return torch.tanh(img)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        *,
+        z2: torch.Tensor | None = None,
+        mixing_prob: float = 0.0,
+        truncation_psi: float = 1.0,
+        truncation_latent: torch.Tensor | None = None,
+        return_ws: bool = False,
+        update_w_avg: bool | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        ws = self.make_ws(
+            z,
+            z2=z2,
+            mixing_prob=mixing_prob,
+            truncation_psi=truncation_psi,
+            truncation_latent=truncation_latent,
+            update_w_avg=update_w_avg,
+        )
+        img = self.synthesis(ws)
+        if return_ws:
+            return img, ws
+        return img
 
 
 class ConvLayer(nn.Module):
@@ -349,15 +400,19 @@ class Discriminator(nn.Module):
 class EMA:
     """Exponential moving average of Generator weights."""
 
-    def __init__(self, G: nn.Module, half_life: int = 10_000):
+    def __init__(self, G: nn.Module, half_life: int = 10_000, rampup: float | None = 0.05):
         self.shadow = copy.deepcopy(G).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
         self.half_life = half_life
+        self.rampup = rampup
 
     @torch.no_grad()
-    def update(self, G: nn.Module, batch_size: int) -> None:
-        decay = 0.5 ** (batch_size / self.half_life)
+    def update(self, G: nn.Module, batch_size: int, images_seen: int = 0) -> None:
+        half_life = float(self.half_life)
+        if self.rampup is not None:
+            half_life = min(half_life, max(float(images_seen), 1.0) * self.rampup)
+        decay = 0.5 ** (batch_size / max(half_life, 1e-8))
         for sp, p in zip(self.shadow.parameters(), G.parameters()):
             sp.mul_(decay).add_(p.detach(), alpha=1.0 - decay)
         for sb, b in zip(self.shadow.buffers(), G.buffers()):
@@ -373,11 +428,12 @@ class EMA:
 STYLEGAN_1024_GENERATOR_CONFIG = GeneratorConfig(
     z_dim=512,
     resolutions=[4, 8, 16, 32, 64, 128, 256, 512, 1024],
-    channels={4: 512, 8: 512, 16: 512, 32: 512, 64: 256, 128: 128, 256: 96, 512: 64, 1024: 32},
+    channels={4: 600, 8: 600, 16: 600, 32: 600, 64: 352, 128: 224, 256: 160, 512: 96, 1024: 64},
     w_dim=512,
-    mapping_layers=4,
+    mapping_layers=8,
     mapping_lr_mul=0.01,
     use_noise=True,
+    w_avg_beta=0.995,
 )
 
 STYLEGAN_1024_DISCRIMINATOR_CONFIG = DiscriminatorConfig(
@@ -394,20 +450,6 @@ def build_stylegan_1024_generator() -> Generator:
 
 def build_stylegan_1024_discriminator() -> Discriminator:
     return Discriminator(STYLEGAN_1024_DISCRIMINATOR_CONFIG)
-
-
-# Backward-compatible names used by older scripts/checkpoints in this package.
-BASELINE_256_GENERATOR_CONFIG = STYLEGAN_1024_GENERATOR_CONFIG
-BASELINE_256_DISCRIMINATOR_CONFIG = STYLEGAN_1024_DISCRIMINATOR_CONFIG
-
-
-def build_baseline_256_generator() -> Generator:
-    return build_stylegan_1024_generator()
-
-
-def build_baseline_256_discriminator() -> Discriminator:
-    return build_stylegan_1024_discriminator()
-
 
 if __name__ == "__main__":
     G = build_stylegan_1024_generator()

@@ -1,32 +1,23 @@
-"""Fine-tune script
+﻿"""Train the Project 2 StyleGAN2-like GAN.
 
-Two start modes:
+Start modes:
 
-1) Fine-tune from the distributed 256 baseline (most common):
-       python scripts/train.py --config configs/baseline_256.yaml \
-                               --init-from ckpt/ffhq256_baseline.pt
+1) Start or partially initialize from a compatible checkpoint:
+       python train.py --config configs/stylegan_256.yaml --init-from runs/stylegan_256/final.pt
 
-2) Resume your own training run from a full ckpt you saved earlier:
-       python scripts/train.py --config configs/baseline_256.yaml \
-                               --resume runs/my_run/ckpt_001000000.pt
+2) Resume a full checkpoint saved by this script:
+       python train.py --config configs/stylegan_256.yaml --resume runs/stylegan_256/latest.pt
 
-   `--resume` restores G, D, G_ema, both optimizers, and RNG state — bit-for-bit
-   continuation (assuming the same architecture).
-
-Recipe (the one that worked after three divergences):
-- ResNet GAN: GN on G, Spectral Norm on D, self-attention at 32×32
-- Non-saturating logistic loss + R1 (lazy every 16 D steps, γ=10)
-- DiffAug 'color,translation' (cutout disabled — too aggressive)
-- Adam β=(0, 0.9), G lr = D lr = 1e-3 (avoid TTUR until you observe a problem)
-- EMA G (half-life 10k images)
-- fp32 throughout
-
-Logging via wandb if installed and not disabled.
-FID is measured periodically when training.fid_every_steps > 0 and pytorch-fid is installed.
+Recipe:
+- StyleGAN2-like G with 8-layer mapping, per-layer styles, and style mixing.
+- Non-saturating logistic loss plus lazy R1 and path length regularization.
+- Adam betas=(0, 0.99), G lr = D lr = 0.002 by default.
+- EMA G with 10 kimg half-life and optional rampup.
 """
 from __future__ import annotations
 
 import argparse
+import math
 import threading
 import time
 from dataclasses import asdict
@@ -68,7 +59,7 @@ from src.model import (
 
 
 def load_config(path: Path) -> dict:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -174,6 +165,26 @@ def set_optimizer_lr(
     return lr
 
 
+def path_length_regularization(
+    G: Generator,
+    z: torch.Tensor,
+    pl_mean: torch.Tensor,
+    *,
+    decay: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fake, ws = G(z, return_ws=True, update_w_avg=False)
+    noise = torch.randn_like(fake) / math.sqrt(fake.shape[2] * fake.shape[3])
+    (grad,) = torch.autograd.grad(
+        outputs=(fake * noise).sum(),
+        inputs=ws,
+        create_graph=True,
+    )
+    path_lengths = grad.square().sum(dim=2).mean(dim=1).sqrt()
+    next_pl_mean = pl_mean.lerp(path_lengths.detach().mean(), decay)
+    penalty = (path_lengths - next_pl_mean).square().mean()
+    return penalty, path_lengths.detach().mean(), next_pl_mean.detach()
+
+
 @torch.no_grad()
 def calculate_fid(
     G: torch.nn.Module,
@@ -250,10 +261,12 @@ def build_checkpoint(
     d_cfg: DiscriminatorConfig,
     training_cfg: dict,
     wandb_run_id: str | None,
+    pl_mean: torch.Tensor | None = None,
 ) -> dict:
     return {
         "images_seen": images_seen,
         "step": step,
+        "pl_mean": None if pl_mean is None else float(pl_mean.detach().cpu().item()),
         "G_state": G.state_dict(),
         "D_state": D.state_dict(),
         "G_ema_state": G_ema.state_dict(),
@@ -285,22 +298,14 @@ def load_matching_state(module: torch.nn.Module, state: dict, label: str) -> int
     return len(matched)
 
 
-def init_from_baseline(
+def init_from_checkpoint(
     init_path: Path,
     G: torch.nn.Module,
     D: torch.nn.Module,
     G_ema: EMA,
     device: str,
 ) -> None:
-    """Load only tensors whose names and shapes match the current stage.
-
-    If you scale the architecture (add 512 / 1024 blocks, change channels,
-    swap the up-block design, etc.), this will raise — and that's intentional.
-    The transfer-learning recipe (which keys carry over, how to remap the
-    discriminator's reverse-ordered stage indices, what to do with the
-    last block's shape mismatch) is part of the assignment. Replace this
-    function or write your own loader before scaling.
-    """
+    """Load tensors whose names and shapes match the current architecture."""
     print(f"Initializing from checkpoint with matching tensors: {init_path}")
     ckpt = torch.load(init_path, map_location=device, weights_only=False)
     total_loaded = 0
@@ -319,8 +324,8 @@ def main() -> None:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument(
         "--init-from", type=Path, default=None,
-        help="Path to a (possibly slim) baseline ckpt. Partial load with "
-             "strict=False; optimizers/RNG start fresh.",
+        help="Path to a checkpoint for partial weight initialization. "
+             "Optimizers/RNG start fresh.",
     )
     parser.add_argument(
         "--resume", type=Path, default=None,
@@ -368,10 +373,6 @@ def main() -> None:
         help="Override training.precision.",
     )
     parser.add_argument(
-        "--new-wandb-run", action="store_true",
-        help="Deprecated compatibility flag; --resume starts a fresh wandb run by default.",
-    )
-    parser.add_argument(
         "--resume-wandb-run", action="store_true",
         help="When --resume, reattach to the wandb run id stored in the checkpoint.",
     )
@@ -391,8 +392,6 @@ def main() -> None:
 
     if args.init_from is not None and args.resume is not None:
         raise SystemExit("Use either --init-from or --resume, not both.")
-    if args.new_wandb_run and args.resume_wandb_run:
-        raise SystemExit("Use either --new-wandb-run or --resume-wandb-run, not both.")
 
     cfg = load_config(args.config)
     train_cfg = cfg["training"]
@@ -466,7 +465,12 @@ def main() -> None:
         f"decay_steps={int(train_cfg.get('lr_decay_steps', 0) or 0)}"
     )
 
-    G_ema = EMA(G, half_life=train_cfg["ema_half_life"])
+    ema_kimg = float(train_cfg.get("ema_kimg", 10.0))
+    ema_half_life = int(train_cfg.get("ema_half_life", ema_kimg * 1000))
+    ema_rampup = train_cfg.get("ema_rampup", 0.05)
+    if ema_rampup is not None:
+        ema_rampup = float(ema_rampup)
+    G_ema = EMA(G, half_life=ema_half_life, rampup=ema_rampup)
     G_ema.shadow.to(device)
 
     dataset = ZipImageDataset(train_cfg["train_zip"], flip=train_cfg["flip"])
@@ -529,9 +533,10 @@ def main() -> None:
     images_seen = 0
     step = 0
     wandb_run_id: str | None = None
+    pl_mean = torch.zeros((), device=device)
 
     if args.init_from is not None:
-        init_from_baseline(args.init_from, G, D, G_ema, device=device)
+        init_from_checkpoint(args.init_from, G, D, G_ema, device=device)
 
     if args.resume is not None:
         print(f"Resuming from {args.resume}")
@@ -545,6 +550,7 @@ def main() -> None:
             optD.load_state_dict(ckpt["optD_state"])
         images_seen = ckpt.get("images_seen", 0)
         step = ckpt.get("step", 0)
+        pl_mean = torch.as_tensor(ckpt.get("pl_mean", 0.0) or 0.0, device=device)
         set_optimizer_lr(optG, lr_g, step, train_cfg)
         set_optimizer_lr(optD, lr_d, step, train_cfg)
         wandb_run_id = ckpt.get("wandb_run_id") if args.resume_wandb_run else None
@@ -581,6 +587,11 @@ def main() -> None:
     z_dim = g_cfg.z_dim
     r1_gamma = train_cfg["r1_gamma"]
     r1_lazy_every = train_cfg["r1_lazy_every"]
+    style_mixing_prob = float(train_cfg.get("style_mixing_prob", 0.0))
+    pl_weight = float(train_cfg.get("path_regularize_weight", 0.0))
+    pl_decay = float(train_cfg.get("path_length_decay", 0.01))
+    pl_shrink = max(1, int(train_cfg.get("path_length_batch_shrink", 2)))
+    pl_every = max(1, int(train_cfg.get("path_length_lazy_every", 4)))
     log_every = train_cfg["log_every"]
     ckpt_every = train_cfg["ckpt_every"]
     ckpt_every_steps = int(train_cfg.get("ckpt_every_steps", 0) or 0)
@@ -617,6 +628,8 @@ def main() -> None:
     window_t0 = time.perf_counter()
     window_imgs = 0
     last_r1_value: float | None = None
+    last_pl_value: float | None = None
+    last_path_length: float | None = None
 
     print(
         f"Training: images_seen={images_seen} → {total_images} "
@@ -702,14 +715,29 @@ def main() -> None:
         d_fake_g_mean_log = 0.0
         for b in micro_batch_sizes:
             z = torch.randn(b, z_dim, device=device)
+            z2 = torch.randn(b, z_dim, device=device) if style_mixing_prob > 0.0 else None
             with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-                fake = G(z)
+                fake = G(z, z2=z2, mixing_prob=style_mixing_prob)
                 d_fake_g = D(diff_augment(fake, augment_policy))
                 l_g = ns_logistic_g(d_fake_g)
             (l_g / grad_accum_steps).backward()
             l_g_log += float(l_g.item())
             d_fake_g_mean_log += float(d_fake_g.float().mean().item())
             fake_for_stats = fake.detach().float()
+
+        did_pl = pl_weight > 0.0 and (step + 1) % pl_every == 0
+        if did_pl:
+            pl_batch = max(1, micro_batch_sizes[0] // pl_shrink)
+            z_pl = torch.randn(pl_batch, z_dim, device=device)
+            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=False):
+                pl_penalty, path_length, next_pl_mean = path_length_regularization(
+                    G, z_pl, pl_mean, decay=pl_decay,
+                )
+                l_pl = pl_penalty * pl_weight * pl_every
+            l_pl.backward()
+            pl_mean = next_pl_mean
+            last_pl_value = float(l_pl.item()) / pl_every
+            last_path_length = float(path_length.item())
         l_g_log /= grad_accum_steps
         d_fake_g_mean_log /= grad_accum_steps
 
@@ -718,7 +746,7 @@ def main() -> None:
         )
         optG.step()
 
-        G_ema.update(G, total_b)
+        G_ema.update(G, total_b, images_seen=images_seen)
 
         images_seen += total_b
         window_imgs += total_b
@@ -757,6 +785,10 @@ def main() -> None:
             }
             if last_r1_value is not None:
                 log["loss/R1"] = last_r1_value
+            if last_pl_value is not None:
+                log["loss/path_length_reg"] = last_pl_value
+                log["stats/path_length"] = last_path_length
+                log["stats/path_length_mean"] = float(pl_mean.item())
             if wandb_mode != "disabled":
                 wandb.log(log, step=step)
             else:
@@ -798,6 +830,7 @@ def main() -> None:
                 G=G, D=D, G_ema=G_ema, optG=optG, optD=optD,
                 g_cfg=g_cfg, d_cfg=d_cfg, training_cfg=train_cfg,
                 wandb_run_id=wandb_run_id,
+                pl_mean=pl_mean,
             )
             latest_path = run_dir / "latest.pt"
             grid_path = samples_dir / f"grid_{images_seen:09d}.png"
@@ -826,6 +859,7 @@ def main() -> None:
         G=G, D=D, G_ema=G_ema, optG=optG, optD=optD,
         g_cfg=g_cfg, d_cfg=d_cfg, training_cfg=train_cfg,
         wandb_run_id=wandb_run_id,
+        pl_mean=pl_mean,
     )
     for t in save_threads:
         t.join()

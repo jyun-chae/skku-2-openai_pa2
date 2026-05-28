@@ -1,16 +1,6 @@
-"""Differentiable Augmentation (Zhao et al. 2020, https://arxiv.org/abs/2006.10738).
+﻿"""Differentiable augmentation helpers.
 
-Applies the same augmentation independently to real and fake before the
-discriminator; all ops are differentiable so G still gets a gradient back.
-
-Usage:
-    d_real = D(diff_augment(real, policy="color,translation"))
-    d_fake = D(diff_augment(fake, policy="color,translation"))
-
-Pass policy="" or None to disable.
-
-Available tags: color, translation, cutout.
-TA baseline used "color,translation" (cutout disabled — 50% mask was too aggressive).
+Pass policy="" or None to disable. Available tags: color, translation, cutout.
 """
 from __future__ import annotations
 
@@ -18,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 
-def diff_augment(x: torch.Tensor, policy: str | None = "color,translation") -> torch.Tensor:
+def diff_augment(x: torch.Tensor, policy: str | None = "") -> torch.Tensor:
     if not policy:
         return x
     for tag in policy.split(","):
