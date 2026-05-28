@@ -325,7 +325,7 @@ def main() -> None:
     parser.add_argument(
         "--resume", type=Path, default=None,
         help="Path to a full ckpt saved by this same script. Restores "
-             "G/D/G_ema/optimizers/RNG/wandb run id.",
+             "G/D/G_ema/optimizers/RNG. Starts a new wandb run by default.",
     )
     parser.add_argument("--total-images", type=int, default=None)
     parser.add_argument(
@@ -369,7 +369,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--new-wandb-run", action="store_true",
-        help="When --resume, start a fresh wandb run instead of reattaching.",
+        help="Deprecated compatibility flag; --resume starts a fresh wandb run by default.",
+    )
+    parser.add_argument(
+        "--resume-wandb-run", action="store_true",
+        help="When --resume, reattach to the wandb run id stored in the checkpoint.",
     )
     parser.add_argument(
         "--fid-every-steps", type=int, default=None,
@@ -387,6 +391,8 @@ def main() -> None:
 
     if args.init_from is not None and args.resume is not None:
         raise SystemExit("Use either --init-from or --resume, not both.")
+    if args.new_wandb_run and args.resume_wandb_run:
+        raise SystemExit("Use either --new-wandb-run or --resume-wandb-run, not both.")
 
     cfg = load_config(args.config)
     train_cfg = cfg["training"]
@@ -541,7 +547,7 @@ def main() -> None:
         step = ckpt.get("step", 0)
         set_optimizer_lr(optG, lr_g, step, train_cfg)
         set_optimizer_lr(optD, lr_d, step, train_cfg)
-        wandb_run_id = None if args.new_wandb_run else ckpt.get("wandb_run_id")
+        wandb_run_id = ckpt.get("wandb_run_id") if args.resume_wandb_run else None
         rng = ckpt.get("rng_state", {})
         if rng.get("torch") is not None:
             torch.set_rng_state(rng["torch"].cpu())

@@ -45,6 +45,10 @@ python train.py --config configs/stylegan_256.yaml --max-steps 2000
 python train.py --config configs/stylegan_256.yaml --resume runs/stylegan_256/latest.pt --max-steps 2000
 ```
 
+Every `--resume` invocation starts a fresh W&B run by default, so each resumed
+chunk gets its own graphs. Pass `--resume-wandb-run` only if you intentionally
+want to continue logging into the W&B run id saved in the checkpoint.
+
 Each stage config saves both image-count checkpoints and step-count
 checkpoints.  By default it writes:
 
