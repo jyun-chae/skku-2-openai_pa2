@@ -101,7 +101,7 @@ class StyleGAN2Discriminator(nn.Module):
     def __init__(
         self,
         resolution: int = 256,
-        channel_base: int = 32768,
+        channel_base: int = 65536,   # must match generator's channel_base
         channel_max: int = 512,
         mbstd_group: int = 4,
     ) -> None:

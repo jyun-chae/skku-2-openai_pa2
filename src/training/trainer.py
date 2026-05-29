@@ -84,7 +84,10 @@ class Trainer:
 
     def _setup_optimizers(self) -> None:
         cfg = self.cfg
-        # Lazy-reg LR scaling (StyleGAN2)
+        # Lazy regularization LR correction (StyleGAN2 §B).
+        # With lazy reg, effective steps per kimg = interval/(interval+1) of a
+        # non-lazy run. Scaling LR and beta2 by the same ratio keeps the
+        # effective learning dynamics identical to non-lazy training.
         g_ratio = cfg.g_reg_interval / (cfg.g_reg_interval + 1)
         d_ratio = cfg.d_reg_interval / (cfg.d_reg_interval + 1)
 
@@ -114,6 +117,9 @@ class Trainer:
 
     def d_step(self, real_img: torch.Tensor) -> dict:
         cfg = self.cfg
+        # Freeze G so its parameters don't accumulate unused gradients.
+        # D.requires_grad_(True) is redundant here (it's the default) but
+        # makes the intent explicit after the previous g_step froze D.
         self.D.requires_grad_(True)
         self.G.requires_grad_(False)
 
@@ -158,6 +164,9 @@ class Trainer:
 
     def g_step(self) -> dict:
         cfg = self.cfg
+        # Freeze D to skip computing its parameter gradients during G's forward.
+        # The frozen D still participates in the forward pass (needed for the loss),
+        # but no D gradients are materialised, saving ~half the backward memory.
         self.D.requires_grad_(False)
         self.G.requires_grad_(True)
 
@@ -180,12 +189,16 @@ class Trainer:
         # Lazy path-length regularization
         if self.step % cfg.g_reg_interval == 0:
             z_pl = self._sample_z(max(1, cfg.batch_size // 2))
-            # Map z→w without tracking grad through mapping; then differentiate
-            # only the synthesis network w.r.t. w (standard StyleGAN2 approach).
+            # PL reg differentiates the *synthesis* network w.r.t. w only —
+            # not the mapping network. Reason: we want the synthesis Jacobian
+            # to be well-conditioned; the mapping is already regularised by
+            # its slower lr_mul and the disentanglement objective.
+            # Strategy: run mapping under no_grad, then make w a leaf node.
             with torch.no_grad():
                 w_pl = self.G.mapping(z_pl)
-            w_pl = w_pl.detach().requires_grad_(True)   # leaf node in synthesis graph
-            with autocast(enabled=False):               # float32 for stable grad norm
+            w_pl = w_pl.detach().requires_grad_(True)   # leaf → only synthesis is differentiated
+            # fp32 for stable Frobenius norm computation (grad² sums are large)
+            with autocast(enabled=False):
                 fake_img_pl = self.G(w=w_pl, noise_mode="random").float()
                 pl_loss, self.mean_path_length, pl_lengths = g_path_length_loss(
                     fake_img_pl, w_pl, self.mean_path_length, decay=cfg.pl_decay
@@ -333,13 +346,16 @@ class Trainer:
     def _log_samples(self, wandb_run, n: int = 16) -> None:
         import wandb
         self.G.eval()
-        z = torch.randn(n, self.cfg.z_dim, device=self.device)
-        imgs = self.G(z, noise_mode="const")          # [-1, 1]
-        imgs = (imgs.clamp(-1, 1) + 1) / 2           # [0, 1]
-        imgs = imgs.cpu()
-        grid = _make_grid(imgs, nrow=int(n ** 0.5))
-        wandb_run.log({"step": self.step, "samples": wandb.Image(grid)})
-        self.G.train()
+        try:
+            z = torch.randn(n, self.cfg.z_dim, device=self.device)
+            imgs = self.G(z, noise_mode="const")      # [-1, 1], reproducible
+            imgs = (imgs.clamp(-1, 1) + 1) / 2       # [0, 1]
+            grid = _make_grid(imgs.cpu(), nrow=int(n ** 0.5))
+            wandb_run.log({"step": self.step, "samples": wandb.Image(grid)})
+        finally:
+            # Always restore train mode — an exception here would otherwise
+            # leave G in eval mode and corrupt subsequent training steps.
+            self.G.train()
 
 
 # ---------------------------------------------------------------------------

@@ -1,13 +1,23 @@
 """StyleGAN2 Generator: Mapping Network + Synthesis Network.
 
-Progressive training is handled by resolution parameter at construction:
-  - Build a 256-resolution model, train it.
-  - Build a 512-resolution model, load 256 weights (new blocks random-init).
-  - Build a 1024-resolution model, load 512 weights.
+Progressive training flow:
+  256  → train from scratch
+  512  → load 256 weights, random-init new block
+  1024 → load 512 weights, random-init new block
 
-Channel schedule (channel_base=32768, channel_max=512):
-  4→512  8→512  16→512  32→512  64→512  128→256  256→128  512→64  1024→32
-This yields ~30M parameters for the full 1024 generator (under the 40M limit).
+Channel schedule (channel_base=65536, channel_max=512):
+  res:      4    8   16   32   64  128  256  512 1024
+  channels: 512 512  512  512  512  512  256  128   64
+Tuned so the 1024-resolution generator has 39.86M parameters,
+which is the maximum that fits within the 40M ONNX submission limit.
+
+Design notes:
+  - Mapping network uses lr_mul=0.01 so it trains ~100× slower than synthesis.
+    This prevents the mapping from collapsing to a trivial solution early on.
+  - _synthesis is split from forward so PL regularization can supply w directly
+    as a leaf node (differentiating synthesis only, not the mapping network).
+  - Skip-RGB architecture: each block adds a bilinearly upsampled RGB contribution;
+    the final image is the accumulated sum passed through tanh.
 """
 
 from __future__ import annotations
@@ -202,19 +212,23 @@ class StyleGAN2Generator(nn.Module):
         ws = self._w_broadcast(w)
         b = w.shape[0]
 
-        def _noise(h: int, ww: int) -> Optional[torch.Tensor]:
+        def _noise(h: int, ww: int, idx: int = 0) -> Optional[torch.Tensor]:
             if noise_mode == "none":
                 return torch.zeros(b, 1, h, ww, device=w.device)
             if noise_mode == "const":
-                g = torch.Generator(device=w.device).manual_seed(0)
+                # Unique seed per (resolution, conv-index) so that:
+                #   - n1 and n2 within the same block have different patterns
+                #   - patterns are reproducible across calls (same seed = same output)
+                seed = h * 2000 + ww * 2 + idx
+                g = torch.Generator(device=w.device).manual_seed(seed)
                 return torch.randn(1, 1, h, ww, generator=g, device=w.device).expand(b, -1, -1, -1)
-            return None   # NoiseInjection will sample dynamically
+            return None   # NoiseInjection samples dynamically (training default)
 
         x, rgb = self.b4(ws[0])
         for i, block in enumerate(self.blocks):
             h_next = 8 * (2 ** i)
-            n1 = _noise(h_next, h_next)
-            n2 = _noise(h_next, h_next)
+            n1 = _noise(h_next, h_next, idx=0)
+            n2 = _noise(h_next, h_next, idx=1)
             x, rgb = block(x, rgb, ws[i + 1], n1, n2)
 
         return torch.tanh(rgb)
