@@ -138,18 +138,20 @@ class Trainer:
             "D/score_gap": (real_pred.mean() - fake_pred.mean()).item(),
         }
 
-        # Lazy R1 regularization
+        # Lazy R1 regularization — must run in fp32.
+        # Reason: autograd.grad inside autocast returns fp16 gradients whose
+        # pow(2).sum() over 3×H×W pixels easily overflows fp16 (max 65504),
+        # producing inf/NaN in the penalty before GradScaler can catch it.
         if self.step % cfg.d_reg_interval == 0:
-            real_img_r1 = real_img.detach().requires_grad_(True)
-            with autocast(enabled=cfg.use_amp):
+            real_img_r1 = real_img.detach().float().requires_grad_(True)
+            with autocast(enabled=False):
                 real_pred_r1 = self.D(real_img_r1)
                 r1_penalty = d_r1_loss(real_pred_r1, real_img_r1)
                 r1_loss = (cfg.r1_gamma / 2) * r1_penalty * cfg.d_reg_interval
 
             self.d_optim.zero_grad(set_to_none=True)
-            self.d_scaler.scale(r1_loss).backward()
-            self.d_scaler.step(self.d_optim)
-            self.d_scaler.update()
+            r1_loss.backward()          # fp32 backward — no scaler needed
+            self.d_optim.step()
             logs["D/r1_penalty"] = r1_penalty.item()
 
         return logs

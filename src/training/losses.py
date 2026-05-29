@@ -65,7 +65,9 @@ def g_path_length_loss(
         inputs=latents_w,
         create_graph=True,
     )
-    pl_lengths = grad.pow(2).sum(dim=1).sqrt()                     # [B]
+    # +1e-8 before sqrt: grad² sum can be exactly 0 at init, whose backward
+    # derivative is inf and causes NaN on the first PL reg step.
+    pl_lengths = (grad.pow(2).sum(dim=1) + 1e-8).sqrt()            # [B]
     mean_path_length = mean_path_length + decay * (pl_lengths.mean() - mean_path_length)
     pl_loss = (pl_lengths - mean_path_length.detach()).pow(2).mean()
     return pl_loss, mean_path_length.detach(), pl_lengths.detach()

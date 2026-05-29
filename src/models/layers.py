@@ -114,8 +114,12 @@ class ModulatedConv2d(nn.Module):
         weight = self.weight * self.scale * style             # [B, out, in, k, k]
 
         if self.demodulate:
-            d = (weight.pow(2).sum(dim=[2, 3, 4]) + 1e-8).rsqrt()
-            weight = weight * d.view(b, self.out_ch, 1, 1, 1)
+            # Demodulation must be in fp32: fp16 sum of weight² overflows when
+            # channels × k² values accumulate (e.g. 512×9 ≈ 4608 terms).
+            # rsqrt(overflow→inf) = 0 would silently zero-out every weight.
+            w32 = weight.float()
+            d = (w32.pow(2).sum(dim=[2, 3, 4]) + 1e-8).rsqrt()
+            weight = (w32 * d.view(b, self.out_ch, 1, 1, 1)).to(x.dtype)
 
         if self.upsample:
             x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
