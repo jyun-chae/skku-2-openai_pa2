@@ -24,9 +24,11 @@ runs/
 # ── WandB ────────────────────────────────────────────────────────────────────
 wandb/
 
-# ── Data (large; extracted locally) ─────────────────────────────────────────
-data/
-*.zip
+# ── Data ─────────────────────────────────────────────────────────────────────
+# Extracted images are ignored (too many files); zip files in data/ ARE tracked.
+data/**/*.png
+data/**/*.jpg
+data/**/*.jpeg
 *.tar
 *.tar.gz
 *.tar.bz2
