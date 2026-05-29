@@ -1,5 +1,4 @@
 # ── Resolution 512×512 (fine-tune from 256 checkpoint) ─────────────────────
-# A100 80GB estimated VRAM usage: ~8.9GB / 80GB.
 resolution: 512
 z_dim: 512
 w_dim: 640
@@ -8,7 +7,6 @@ channel_max: 512
 mapping_layers: 12
 mapping_lr_mul: 0.01
 
-# Lower LR for fine-tuning a higher resolution
 lr_g: 0.001
 lr_d: 0.001
 grad_clip: 1.0
@@ -18,11 +16,12 @@ g_reg_interval: 4
 r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
+pl_warmup_steps: 0   # 256 model already has realistic mean_path_length
 
-batch_size: 16      # 16× (3×512×512) activations; ~8.9GB VRAM on A100
+batch_size: 8
 num_workers: 4
 
-total_kimg: 10000   # ~10M images ≈ 5–8 hours on A100
+total_kimg: 10000
 
 log_interval: 100
 sample_interval: 500

@@ -22,7 +22,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from ..models.generator import StyleGAN2Generator
@@ -105,8 +105,8 @@ class Trainer:
         )
 
     def _setup_scalers(self) -> None:
-        self.g_scaler = GradScaler(enabled=self.cfg.use_amp)
-        self.d_scaler = GradScaler(enabled=self.cfg.use_amp)
+        self.g_scaler = GradScaler("cuda", enabled=self.cfg.use_amp)
+        self.d_scaler = GradScaler("cuda", enabled=self.cfg.use_amp)
 
     # ------------------------------------------------------------------
     # Training step
@@ -126,7 +126,7 @@ class Trainer:
         real_img = real_img.to(self.device)
         z = self._sample_z(real_img.shape[0])
 
-        with autocast(enabled=cfg.use_amp):
+        with autocast("cuda", enabled=cfg.use_amp):
             fake_img = self.G(z, noise_mode="random").detach()
             real_pred = self.D(real_img)
             fake_pred = self.D(fake_img)
@@ -137,11 +137,17 @@ class Trainer:
         self.d_scaler.step(self.d_optim)
         self.d_scaler.update()
 
+        real_score = real_pred.mean().item()
+        fake_score = fake_pred.mean().item()
         logs = {
             "D/loss": d_loss.item(),
-            "D/real_score": real_pred.mean().item(),
-            "D/fake_score": fake_pred.mean().item(),
-            "D/score_gap": (real_pred.mean() - fake_pred.mean()).item(),
+            "D/real_score": real_score,
+            "D/fake_score": fake_score,
+            "D/score_gap": real_score - fake_score,
+            # Sigmoid-scaled versions: should both converge toward 0.5 at equilibrium.
+            # Easier to read than raw logits (bounded in [0, 1]).
+            "D/real_score_sig": torch.sigmoid(real_pred).mean().item(),
+            "D/fake_score_sig": torch.sigmoid(fake_pred).mean().item(),
         }
 
         # Lazy R1 regularization — must run in fp32.
@@ -150,13 +156,14 @@ class Trainer:
         # producing inf/NaN in the penalty before GradScaler can catch it.
         if self.step % cfg.d_reg_interval == 0:
             real_img_r1 = real_img.detach().float().requires_grad_(True)
-            with autocast(enabled=False):
+            with autocast("cuda", enabled=False):
                 real_pred_r1 = self.D(real_img_r1)
                 r1_penalty = d_r1_loss(real_pred_r1, real_img_r1)
                 r1_loss = (cfg.r1_gamma / 2) * r1_penalty * cfg.d_reg_interval
 
             self.d_optim.zero_grad(set_to_none=True)
             r1_loss.backward()          # fp32 backward — no scaler needed
+            nn.utils.clip_grad_norm_(self.D.parameters(), max_norm=cfg.grad_clip)
             self.d_optim.step()
             logs["D/r1_penalty"] = r1_penalty.item()
 
@@ -172,7 +179,7 @@ class Trainer:
 
         z = self._sample_z(cfg.batch_size)
 
-        with autocast(enabled=cfg.use_amp):
+        with autocast("cuda", enabled=cfg.use_amp):
             fake_img, w = self.G(z, noise_mode="random", return_w=True)
             fake_pred = self.D(fake_img)
             g_loss = g_nonsaturating_loss(fake_pred)
@@ -184,10 +191,22 @@ class Trainer:
         self.g_scaler.step(self.g_optim)
         self.g_scaler.update()
 
-        logs = {"G/loss": g_loss.item()}
+        # Log generated image statistics — a std → 0 means G is collapsing
+        with torch.no_grad():
+            img_stats = fake_img.detach().float()
+            logs = {
+                "G/loss": g_loss.item(),
+                "G/img_mean": img_stats.mean().item(),
+                "G/img_std": img_stats.std().item(),
+            }
 
         # Lazy path-length regularization
-        if self.step % cfg.g_reg_interval == 0:
+        # Skip the first pl_warmup_steps: mean_path_length starts at 0, so the
+        # target is 0 and pl_loss = pl_lengths² which can be 25-100+. This pushes
+        # G to reduce sensitivity to w immediately (→ solid-color mode collapse).
+        # After warmup the EMA has a realistic target and PL stabilises training.
+        pl_warmup = getattr(cfg, "pl_warmup_steps", 0)
+        if self.step % cfg.g_reg_interval == 0 and self.step >= pl_warmup:
             z_pl = self._sample_z(max(1, cfg.batch_size // 2))
             # PL reg differentiates the *synthesis* network w.r.t. w only —
             # not the mapping network. Reason: we want the synthesis Jacobian
@@ -198,7 +217,7 @@ class Trainer:
                 w_pl = self.G.mapping(z_pl)
             w_pl = w_pl.detach().requires_grad_(True)   # leaf → only synthesis is differentiated
             # fp32 for stable Frobenius norm computation (grad² sums are large)
-            with autocast(enabled=False):
+            with autocast("cuda", enabled=False):
                 fake_img_pl = self.G(w=w_pl, noise_mode="random").float()
                 pl_loss, self.mean_path_length, pl_lengths = g_path_length_loss(
                     fake_img_pl, w_pl, self.mean_path_length, decay=cfg.pl_decay
@@ -274,7 +293,9 @@ class Trainer:
                 _print_logs(self.step, kimg, logs)
 
                 if wandb_run is not None:
-                    wandb_run.log({"step": self.step, "kimg": kimg, **logs})
+                    # Pass step= as a kwarg so WandB uses the actual training
+                    # step as the x-axis (not its internal log-call counter).
+                    wandb_run.log({"kimg": kimg, **logs}, step=self.step)
 
             # ----------------------------------------------------------
             # Sample images → WandB
@@ -293,7 +314,7 @@ class Trainer:
                 )
                 print(f"  [FID] step={self.step}  FID={fid:.2f}")
                 if wandb_run is not None:
-                    wandb_run.log({"step": self.step, "FID": fid})
+                    wandb_run.log({"FID": fid}, step=self.step)
 
             # ----------------------------------------------------------
             # Checkpoint
@@ -351,7 +372,7 @@ class Trainer:
             imgs = self.G(z, noise_mode="const")      # [-1, 1], reproducible
             imgs = (imgs.clamp(-1, 1) + 1) / 2       # [0, 1]
             grid = _make_grid(imgs.cpu(), nrow=int(n ** 0.5))
-            wandb_run.log({"step": self.step, "samples": wandb.Image(grid)})
+            wandb_run.log({"samples": wandb.Image(grid)}, step=self.step)
         finally:
             # Always restore train mode — an exception here would otherwise
             # leave G in eval mode and corrupt subsequent training steps.

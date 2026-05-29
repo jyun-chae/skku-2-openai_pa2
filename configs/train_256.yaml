@@ -1,33 +1,39 @@
 # ── Resolution 256×256 ──────────────────────────────────────────────────────
 # Optimal config: G = 39.862M params (under 40M ONNX limit, maximised).
-# A100 80GB estimated VRAM usage: ~8.2GB / 80GB.
+# A100 80GB estimated VRAM usage: ~6GB / 80GB (batch=16).
 resolution: 256
 z_dim: 512
-w_dim: 640          # tuned to maximise params under 40M (StyleGAN2 default: 512)
-w_dim_z: 512        # z input dim; first mapping layer 512→640
-channel_base: 65536 # extends 512-ch depth to res≤128 (default: 32768 caps at res≤64)
+w_dim: 640
+channel_base: 65536
 channel_max: 512
-mapping_layers: 12  # deeper mapping (default: 8) fills remaining budget
+mapping_layers: 12
 mapping_lr_mul: 0.01
 
-# Optimiser (StyleGAN2 default with lazy-reg LR scaling applied in Trainer)
+# Optimiser
 lr_g: 0.002
 lr_d: 0.002
-grad_clip: 1.0      # max-norm gradient clipping on G
+grad_clip: 1.0
 
 # Lazy regularisation (StyleGAN2 defaults)
-d_reg_interval: 16  # R1 every 16 D steps
-g_reg_interval: 4   # path-length every 4 G steps
+d_reg_interval: 16
+g_reg_interval: 4
 r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
+# PL warmup: skip path-length reg for the first N steps.
+# mean_path_length starts at 0, so without warmup the target is 0 and
+# pl_loss = pl_lengths^2 (25–100+) → G collapses to solid-color output.
+# After ~500 steps the EMA reaches a realistic value and PL stabilises.
+pl_warmup_steps: 1000
 
 # Data
-batch_size: 32      # A100 80GB can handle this; halve if OOM
+# batch=16 per GPU: StyleGAN2 paper uses batch/8GPUs=4 per GPU.
+# batch=16 on a single A100 is the practical sweet spot for stability.
+batch_size: 16
 num_workers: 4
 
 # Training schedule
-total_kimg: 25000   # ~50M images ≈ 6–8 hours on A100
+total_kimg: 25000
 
 # Logging / evaluation
 log_interval: 100

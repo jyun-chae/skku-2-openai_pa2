@@ -1,5 +1,4 @@
 # ── Resolution 1024×1024 (fine-tune from 512 checkpoint) ───────────────────
-# A100 80GB estimated VRAM usage: ~9.3GB / 80GB.
 resolution: 1024
 z_dim: 512
 w_dim: 640
@@ -17,11 +16,12 @@ g_reg_interval: 4
 r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
+pl_warmup_steps: 0   # 512 model already has realistic mean_path_length
 
-batch_size: 8       # 8× (3×1024×1024); ~9.3GB VRAM on A100
+batch_size: 4
 num_workers: 4
 
-total_kimg: 10000   # ~10M images ≈ 15–25 hours on A100
+total_kimg: 10000
 
 log_interval: 100
 sample_interval: 500
