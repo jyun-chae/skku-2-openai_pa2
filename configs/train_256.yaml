@@ -1,6 +1,4 @@
 # ── Resolution 256×256 ──────────────────────────────────────────────────────
-# Optimal config: G = 39.862M params (under 40M ONNX limit, maximised).
-# A100 80GB estimated VRAM usage: ~6GB / 80GB (batch=16).
 resolution: 256
 z_dim: 512
 w_dim: 640
@@ -10,25 +8,23 @@ mapping_layers: 12
 mapping_lr_mul: 0.01
 
 # Optimiser
-lr_g: 0.002
-lr_d: 0.002
+# lr 0.002 → 0.001: with beta1=0 Adam and 7 skip-RGB ToRGB blocks, lr=0.002
+# causes accumulated pre-tanh bias drift of ~4.2 in 300 steps → tanh saturates
+# at +1 (all-white collapse) before G can learn anything.
+# lr=0.001 halves the drift (~2.1 in 300 steps) keeping pre-tanh below saturation.
+lr_g: 0.001
+lr_d: 0.001
 grad_clip: 1.0
 
-# Lazy regularisation (StyleGAN2 defaults)
+# Lazy regularisation
 d_reg_interval: 16
 g_reg_interval: 4
 r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
-# PL warmup: skip path-length reg for the first N steps.
-# mean_path_length starts at 0, so without warmup the target is 0 and
-# pl_loss = pl_lengths^2 (25–100+) → G collapses to solid-color output.
-# After ~500 steps the EMA reaches a realistic value and PL stabilises.
 pl_warmup_steps: 1000
 
 # Data
-# batch=16 per GPU: StyleGAN2 paper uses batch/8GPUs=4 per GPU.
-# batch=16 on a single A100 is the practical sweet spot for stability.
 batch_size: 16
 num_workers: 4
 
