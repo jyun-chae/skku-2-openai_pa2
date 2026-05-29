@@ -1,0 +1,32 @@
+# ── Resolution 1024×1024 (fine-tune from 512 checkpoint) ───────────────────
+# A100 80GB estimated VRAM usage: ~9.3GB / 80GB.
+resolution: 1024
+z_dim: 512
+w_dim: 640
+channel_base: 65536
+channel_max: 512
+mapping_layers: 12
+mapping_lr_mul: 0.01
+
+lr_g: 0.0005
+lr_d: 0.0005
+grad_clip: 1.0
+
+d_reg_interval: 16
+g_reg_interval: 4
+r1_gamma: 10.0
+pl_weight: 2.0
+pl_decay: 0.01
+
+batch_size: 8       # 8× (3×1024×1024); ~9.3GB VRAM on A100
+num_workers: 4
+
+total_kimg: 10000   # ~10M images ≈ 15–25 hours on A100
+
+log_interval: 100
+sample_interval: 500
+fid_interval: 2000
+save_interval: 2000
+n_fid_samples: 10000
+
+use_amp: true

@@ -1,0 +1,53 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ── PyTorch / training artefacts ────────────────────────────────────────────
+*.pth
+*.pt
+*.onnx
+*.safetensors
+checkpoints/
+runs/
+
+# ── WandB ────────────────────────────────────────────────────────────────────
+wandb/
+
+# ── Data (large; extracted locally) ─────────────────────────────────────────
+data/
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# ── OS / IDE ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ── uv ───────────────────────────────────────────────────────────────────────
+# uv.lock is intentionally committed for reproducibility.
+# Exclude the uv cache if it somehow ends up here.
+.uv/
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+pdf_text.txt

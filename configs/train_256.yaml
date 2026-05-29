@@ -1,0 +1,39 @@
+# ── Resolution 256×256 ──────────────────────────────────────────────────────
+# Optimal config: G = 39.862M params (under 40M ONNX limit, maximised).
+# A100 80GB estimated VRAM usage: ~8.2GB / 80GB.
+resolution: 256
+z_dim: 512
+w_dim: 640          # tuned to maximise params under 40M (StyleGAN2 default: 512)
+w_dim_z: 512        # z input dim; first mapping layer 512→640
+channel_base: 65536 # extends 512-ch depth to res≤128 (default: 32768 caps at res≤64)
+channel_max: 512
+mapping_layers: 12  # deeper mapping (default: 8) fills remaining budget
+mapping_lr_mul: 0.01
+
+# Optimiser (StyleGAN2 default with lazy-reg LR scaling applied in Trainer)
+lr_g: 0.002
+lr_d: 0.002
+grad_clip: 1.0      # max-norm gradient clipping on G
+
+# Lazy regularisation (StyleGAN2 defaults)
+d_reg_interval: 16  # R1 every 16 D steps
+g_reg_interval: 4   # path-length every 4 G steps
+r1_gamma: 10.0
+pl_weight: 2.0
+pl_decay: 0.01
+
+# Data
+batch_size: 32      # A100 80GB can handle this; halve if OOM
+num_workers: 4
+
+# Training schedule
+total_kimg: 25000   # ~50M images ≈ 6–8 hours on A100
+
+# Logging / evaluation
+log_interval: 100
+sample_interval: 500
+fid_interval: 5000
+save_interval: 5000
+n_fid_samples: 10000
+
+use_amp: true

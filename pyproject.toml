@@ -1,0 +1,33 @@
+[project]
+name = "project02"
+version = "0.1.0"
+description = "StyleGAN2-based 1024×1024 face generation on FFHQ"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "wandb>=0.17.0",
+    "pytorch-fid>=0.3.0",
+    "pyyaml>=6.0",
+    "scikit-image>=0.21.0",
+    "matplotlib>=3.7.0",
+    "onnx>=1.16.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+# ── uv ───────────────────────────────────────────────────────────────────────
+# Run `uv sync` to install a reproducible environment from uv.lock.
+# Run `uv run python -m src.training.trainer` or open main.ipynb via `uv run jupyter`.
+# On Colab: `pip install uv && uv sync` OR just `pip install -r requirements.txt`.
+[tool.uv]
+# PyTorch CUDA wheels are only on the PyTorch index; tell uv where to find them.
+extra-index-url = ["https://download.pytorch.org/whl/cu121"]
