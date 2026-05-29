@@ -321,13 +321,15 @@ class Trainer:
             # ----------------------------------------------------------
             if self.step % cfg.save_interval == 0 and self.step > 0:
                 path = os.path.join(ckpt_dir, f"ckpt_{cfg.resolution}_{self.step:07d}.pth")
-                self.save(path)
+                wandb_id = wandb_run.id if wandb_run is not None else None
+                self.save(path, wandb_run_id=wandb_id)
                 if drive_backup_dir:
                     _backup_to_drive(path, drive_backup_dir)
 
         # Final checkpoint
         path = os.path.join(ckpt_dir, f"ckpt_{cfg.resolution}_final.pth")
-        self.save(path)
+        wandb_id = wandb_run.id if wandb_run is not None else None
+        self.save(path, wandb_run_id=wandb_id)
         if drive_backup_dir:
             _backup_to_drive(path, drive_backup_dir)
         print("[Trainer] Training complete.")
@@ -336,7 +338,7 @@ class Trainer:
     # Checkpoint
     # ------------------------------------------------------------------
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, wandb_run_id: Optional[str] = None) -> None:
         torch.save({
             "step": self.step,
             "G": self.G.state_dict(),
@@ -345,10 +347,12 @@ class Trainer:
             "d_optim": self.d_optim.state_dict(),
             "mean_path_length": self.mean_path_length,
             "cfg": vars(self.cfg) if hasattr(self.cfg, "__dict__") else dict(self.cfg),
+            "wandb_run_id": wandb_run_id,   # saved so WandB can resume the same run
         }, path)
         print(f"  [ckpt] saved → {path}")
 
-    def load(self, path: str, strict: bool = True) -> None:
+    def load(self, path: str, strict: bool = True) -> Optional[str]:
+        """Load checkpoint. Returns the saved WandB run ID (or None) for run resumption."""
         state = torch.load(path, map_location=self.device)
         self.G.load_state_dict(state["G"], strict=strict)
         self.D.load_state_dict(state["D"], strict=strict)
@@ -357,7 +361,9 @@ class Trainer:
             self.d_optim.load_state_dict(state["d_optim"])
             self.step = state["step"]
             self.mean_path_length = state.get("mean_path_length", self.mean_path_length)
-        print(f"  [ckpt] loaded ← {path}  (step={self.step})")
+        wandb_run_id = state.get("wandb_run_id")
+        print(f"  [ckpt] loaded ← {path}  (step={self.step}, wandb_id={wandb_run_id})")
+        return wandb_run_id
 
     # ------------------------------------------------------------------
     # WandB sample grid
@@ -410,3 +416,44 @@ def _backup_to_drive(src: str, drive_dir: str) -> None:
     dst = os.path.join(drive_dir, os.path.basename(src))
     shutil.copy2(src, dst)
     print(f"  [backup] {src} → {dst}")
+
+
+def find_latest_checkpoint(drive_ckpt_dir: str, resolution: int) -> Optional[str]:
+    """Return the path of the most recent checkpoint for `resolution` in Drive.
+
+    Priority: *_final.pth > highest-step numbered file > None (no checkpoint).
+    Call this before training to detect if a previous session left a backup.
+    """
+    import glob
+    finals = glob.glob(os.path.join(drive_ckpt_dir, f"ckpt_{resolution}_final.pth"))
+    if finals:
+        return finals[0]
+    step_ckpts = sorted(glob.glob(os.path.join(drive_ckpt_dir, f"ckpt_{resolution}_*.pth")))
+    return step_ckpts[-1] if step_ckpts else None
+
+
+def restore_from_drive(
+    trainer: "Trainer",
+    drive_ckpt_dir: str,
+    local_ckpt_dir: str,
+    resolution: int,
+) -> bool:
+    """Copy the latest Drive checkpoint to local disk and load it into trainer.
+
+    Returns True if a checkpoint was found and loaded, False if starting fresh.
+
+    Usage in notebook:
+        resumed = restore_from_drive(trainer, DRIVE_CKPT_DIR, CKPT_DIR, 256)
+        if not resumed:
+            # first run: load weights from previous stage, etc.
+    """
+    drive_path = find_latest_checkpoint(drive_ckpt_dir, resolution)
+    if drive_path is None:
+        print(f"  [restore] No checkpoint found in {drive_ckpt_dir} for res={resolution} → starting fresh.")
+        return False
+
+    local_path = os.path.join(local_ckpt_dir, f"ckpt_{resolution}_restored.pth")
+    print(f"  [restore] {os.path.basename(drive_path)} → local …")
+    shutil.copy2(drive_path, local_path)
+    trainer.load(local_path)
+    return True
