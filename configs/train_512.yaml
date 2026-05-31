@@ -16,7 +16,10 @@ g_reg_interval: 4
 r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
-pl_warmup_steps: 0   # 256 model already has realistic mean_path_length
+# mean_path_length is NOT transferred from the 256 checkpoint (different resolution
+# → different path lengths). Trainer starts fresh at 0, so a short warmup prevents
+# the first PL step from using target=0 against the loaded 256 model's path lengths.
+pl_warmup_steps: 500
 
 batch_size: 8
 num_workers: 4
