@@ -141,3 +141,35 @@ class StyleGAN2Discriminator(nn.Module):
         feat = feat.flatten(1)
         feat = self.act(self.fc(feat)) * math.sqrt(2)
         return self.out(feat)
+
+    def load_from_lower_resolution(self, state_dict: dict) -> None:
+        """Load D weights from a lower-resolution checkpoint.
+
+        When resolution doubles, the new D gains:
+          - A new from_rgb for the higher input resolution  (random-init)
+          - A new blocks[0] for the first downsampling step (random-init)
+          - Old blocks[i] → new blocks[i+1]                (loaded)
+          - Final layers (mbstd, conv_4, fc, out) stay the same shape (loaded)
+        """
+        own = self.state_dict()
+        new_state: dict = {}
+
+        for k, v in state_dict.items():
+            if k.startswith('from_rgb.') or k.startswith('blocks.0.'):
+                # New layers introduced at the higher resolution — keep random init
+                continue
+            elif k.startswith('blocks.'):
+                # Shift block index by +1: old blocks[i] → new blocks[i+1]
+                parts = k.split('.')
+                new_key = f'blocks.{int(parts[1]) + 1}.' + '.'.join(parts[2:])
+                if new_key in own and own[new_key].shape == v.shape:
+                    new_state[new_key] = v
+            else:
+                # mbstd, conv_4, act, fc, out — same shape across resolutions
+                if k in own and own[k].shape == v.shape:
+                    new_state[k] = v
+
+        own.update(new_state)
+        self.load_state_dict(own)
+        print(f'D loaded {len(new_state)}/{len(own)} tensors '
+              f'(new from_rgb + blocks.0 are random-init).')
