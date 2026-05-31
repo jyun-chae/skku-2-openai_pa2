@@ -32,6 +32,9 @@ data/**/*.jpeg
 *.tar
 *.tar.gz
 *.tar.bz2
+*.zip
+# Split chunks (.zip.000, .zip.001, …) are also too large for git
+*.zip.[0-9][0-9][0-9]
 
 # ── Jupyter ──────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/

@@ -1,0 +1,163 @@
+{
+  "train_50k_256.zip": {
+    "total_bytes": 1654358368,
+    "chunks": [
+      {
+        "name": "train_50k_256.zip.000",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_256.zip.001",
+        "bytes": 710639968
+      }
+    ]
+  },
+  "train_50k_512.zip": {
+    "total_bytes": 5567009968,
+    "chunks": [
+      {
+        "name": "train_50k_512.zip.000",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_512.zip.001",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_512.zip.002",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_512.zip.003",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_512.zip.004",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_512.zip.005",
+        "bytes": 848417968
+      }
+    ]
+  },
+  "train_50k_1024.zip": {
+    "total_bytes": 18150274775,
+    "chunks": [
+      {
+        "name": "train_50k_1024.zip.000",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.001",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.002",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.003",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.004",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.005",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.006",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.007",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.008",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.009",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.010",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.011",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.012",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.013",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.014",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.015",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.016",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.017",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.018",
+        "bytes": 943718400
+      },
+      {
+        "name": "train_50k_1024.zip.019",
+        "bytes": 219625175
+      }
+    ]
+  },
+  "valid_10k_1024.zip": {
+    "total_bytes": 3632389267,
+    "chunks": [
+      {
+        "name": "valid_10k_1024.zip.000",
+        "bytes": 943718400
+      },
+      {
+        "name": "valid_10k_1024.zip.001",
+        "bytes": 943718400
+      },
+      {
+        "name": "valid_10k_1024.zip.002",
+        "bytes": 943718400
+      },
+      {
+        "name": "valid_10k_1024.zip.003",
+        "bytes": 801234067
+      }
+    ]
+  },
+  "valid_10k_512.zip": {
+    "total_bytes": 1114883898,
+    "chunks": [
+      {
+        "name": "valid_10k_512.zip.000",
+        "bytes": 943718400
+      },
+      {
+        "name": "valid_10k_512.zip.001",
+        "bytes": 171165498
+      }
+    ]
+  }
+}
