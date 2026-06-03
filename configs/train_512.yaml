@@ -13,7 +13,7 @@ grad_clip: 1.0
 
 d_reg_interval: 16
 g_reg_interval: 4
-r1_gamma: 10.0
+r1_gamma: 15.0
 pl_weight: 2.0
 pl_decay: 0.01
 # mean_path_length is NOT transferred from the 256 checkpoint (different resolution
