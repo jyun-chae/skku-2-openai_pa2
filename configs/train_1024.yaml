@@ -16,7 +16,7 @@ g_reg_interval: 4
 r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
-pl_warmup_steps: 0   # 512 model already has realistic mean_path_length
+pl_warmup_steps: 500  # mean_path_length is NOT transferred from 512 ckpt (starts at 0)
 
 batch_size: 4
 num_workers: 4
