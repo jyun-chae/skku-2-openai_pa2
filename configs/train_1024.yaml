@@ -13,7 +13,7 @@ grad_clip: 1.0
 
 d_reg_interval: 16
 g_reg_interval: 4
-r1_gamma: 10.0
+r1_gamma: 50.0
 pl_weight: 2.0
 pl_decay: 0.01
 pl_warmup_steps: 500  # mean_path_length is NOT transferred from 512 ckpt (starts at 0)
