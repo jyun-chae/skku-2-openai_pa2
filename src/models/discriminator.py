@@ -15,7 +15,7 @@ from .layers import EqualConv2d, EqualLinear
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _nf(resolution: int, channel_base: int = 32768, channel_max: int = 512) -> int:
+def _nf(resolution: int, channel_base: int = 131072, channel_max: int = 512) -> int:
     return min(channel_max, int(channel_base / resolution))
 
 
@@ -91,7 +91,7 @@ class StyleGAN2Discriminator(nn.Module):
     def __init__(
         self,
         resolution: int = 256,
-        channel_base: int = 65536,   # must match generator's channel_base
+        channel_base: int = 131072,  # must match generator's channel_base
         channel_max: int = 512,
         mbstd_group: int = 4,
     ) -> None:

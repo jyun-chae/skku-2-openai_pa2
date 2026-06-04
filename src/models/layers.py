@@ -158,9 +158,10 @@ class SqueezeConnection(nn.Module):
 
     def __init__(self, in_ch: int, w_dim: int, ratio: int = 8) -> None:
         super().__init__()
+        # Floor at 8 prevents degenerate 1–2 ch squeeze at small in_ch (e.g. 64//8=8 is fine, 32//8=4 is not).
         s_ch = max(in_ch // ratio, 8)
         self.squeeze = EqualConv2d(in_ch, s_ch, kernel=3, padding=1)
-        self.noise   = NoiseInjection()
+        self.noise   = NoiseInjection()   # replaces noise2 that was removed with conv2
         self.to_rgb  = ToRGB(s_ch, w_dim)
         self.excite  = EqualConv2d(s_ch, in_ch, kernel=3, padding=1)
         self.proj    = EqualConv2d(in_ch * 2, in_ch, kernel=1)

@@ -1,12 +1,13 @@
 """StyleGAN2 Generator with Squeeze Connection synthesis blocks.
 
-Channel schedule (channel_base=65536, channel_max=512):
+Channel schedule (channel_base=131072, channel_max=512):
   res:      4    8   16   32   64  128  256  512 1024
-  channels: 512 512  512  512  512  512  256  128   64
-mapping_layers=8, w_dim=640, squeeze_ratio=8.
+  channels: 512 512  512  512  512  512  512  256  128
+
+mapping_layers=12, w_dim=640, squeeze_ratio=8.
 
 Squeeze connection (StyleGAN-Small, arXiv:2407.05527) replaces conv2+ToRGB
-with squeeze→excite→project path, reducing params while improving skip-RGB.
+with squeeze→excite→project path, improving the toRGB information bottleneck.
 PyTorch params @ 1024: ~34.10M.  ONNX initializer count: ~35.5M (<40M limit).
 """
 
@@ -19,14 +20,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import EqualLinear, ModulatedConv2d, NoiseInjection, PixelNorm, SqueezeConnection, ToRGB
+from .layers import EqualLinear, ModulatedConv2d, NoiseInjection, PixelNorm, SqueezeConnection
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _nf(resolution: int, channel_base: int = 32768, channel_max: int = 512) -> int:
+def _nf(resolution: int, channel_base: int = 131072, channel_max: int = 512) -> int:
     """Number of feature maps at a given resolution (StyleGAN2 schedule)."""
     return min(channel_max, int(channel_base / resolution))
 
@@ -135,16 +136,17 @@ class SynthesisBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class StyleGAN2Generator(nn.Module):
-    """StyleGAN2 generator with skip-RGB synthesis and mapping network.
+    """StyleGAN2 generator: MappingNetwork + SqueezeConnection synthesis.
 
     Args:
-        resolution:    Target output resolution (256, 512, or 1024).
-        z_dim:         Dimension of input noise z.
-        w_dim:         Dimension of intermediate latent w.
-        channel_base:  Base channel multiplier (32768 gives ~30M params for 1024).
-        channel_max:   Maximum channels per layer (capped at 512).
-        mapping_layers: Number of layers in the mapping network.
-        mapping_lr_mul: Learning-rate multiplier for mapping network.
+        resolution:     Output resolution — 256, 512, or 1024.
+        z_dim:          Input noise dimension.
+        w_dim:          Intermediate latent dimension (w-space).
+        channel_base:   Controls channel schedule: nf(r) = min(channel_max, channel_base/r).
+        channel_max:    Hard cap on channels per layer.
+        mapping_layers: Depth of the mapping MLP (more → better disentanglement).
+        mapping_lr_mul: LR multiplier for mapping network (low → slower, more stable).
+        squeeze_ratio:  Squeeze compression ratio in SqueezeConnection (default 8).
     """
 
     def __init__(
@@ -152,7 +154,7 @@ class StyleGAN2Generator(nn.Module):
         resolution: int = 256,
         z_dim: int = 512,
         w_dim: int = 640,
-        channel_base: int = 65536,
+        channel_base: int = 131072,
         channel_max: int = 512,
         mapping_layers: int = 12,
         mapping_lr_mul: float = 0.01,
