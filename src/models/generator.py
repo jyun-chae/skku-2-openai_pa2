@@ -8,8 +8,10 @@ Progressive training flow:
 Channel schedule (channel_base=65536, channel_max=512):
   res:      4    8   16   32   64  128  256  512 1024
   channels: 512 512  512  512  512  512  256  128   64
-Tuned so the 1024-resolution generator has 39.86M parameters,
-which is the maximum that fits within the 40M ONNX submission limit.
+mapping_layers=8 (standard StyleGAN2), w_dim=640.
+PyTorch params @ 1024: ~38.22M.  ONNX initializer count: ~39.6M (<40M limit).
+Note: ONNX count exceeds PyTorch count by ~1.4M due to constant-folded
+intermediates baked into the graph during TorchScript export.
 
 Design notes:
   - Mapping network uses lr_mul=0.01 so it trains ~100× slower than synthesis.
@@ -172,7 +174,7 @@ class StyleGAN2Generator(nn.Module):
         w_dim: int = 640,
         channel_base: int = 65536,
         channel_max: int = 512,
-        mapping_layers: int = 12,
+        mapping_layers: int = 8,
         mapping_lr_mul: float = 0.01,
     ) -> None:
         super().__init__()

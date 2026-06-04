@@ -4,7 +4,7 @@ z_dim: 512
 w_dim: 640
 channel_base: 65536
 channel_max: 512
-mapping_layers: 12
+mapping_layers: 8
 mapping_lr_mul: 0.01
 
 lr_g: 0.001
