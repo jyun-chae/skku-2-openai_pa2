@@ -283,18 +283,15 @@ class StyleGAN2Generator(nn.Module):
 
         self.eval()
         device = next(self.parameters()).device
-        # Always trace with batch=1.
-        # ModulatedConv2d uses F.conv2d(..., groups=B) where B=batch size.
-        # The dynamo exporter makes B symbolic → Conv 'groups' becomes a
-        # SymbolicTensor → ONNX rejects it (groups must be a static INT).
-        # Legacy TorchScript exporter (dynamo=False) traces with concrete B=1,
-        # baking groups=1 as a static constant throughout the graph.
-        # Dynamic batch is fundamentally incompatible with groups=B, so we
-        # export static batch=1 (evaluator generates one image at a time).
-        dummy_z = torch.randn(1, self.z_dim, device=device)
 
         wrapper = _NoNoiseWrapper(self)
         wrapper.eval()
+        # Move to CPU for export: do_constant_folding=True mixes GPU model
+        # tensors with CPU intermediates during the JIT constant-folding pass,
+        # causing "Expected all tensors on same device" RuntimeError on CUDA.
+        # CPU export avoids this; we restore the original device afterwards.
+        wrapper.cpu()
+        dummy_z = torch.randn(1, self.z_dim, device="cpu")
 
         torch.onnx.export(
             wrapper,
@@ -306,6 +303,7 @@ class StyleGAN2Generator(nn.Module):
             do_constant_folding=True,
             dynamo=False,
         )
+        wrapper.to(device)
 
         # Count and verify ONNX parameters
         model_onnx = onnx.load(path)
