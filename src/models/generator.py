@@ -283,7 +283,15 @@ class StyleGAN2Generator(nn.Module):
 
         self.eval()
         device = next(self.parameters()).device
-        dummy_z = torch.randn(batch_size, self.z_dim, device=device)
+        # Always trace with batch=1.
+        # ModulatedConv2d uses F.conv2d(..., groups=B) where B=batch size.
+        # The dynamo exporter makes B symbolic → Conv 'groups' becomes a
+        # SymbolicTensor → ONNX rejects it (groups must be a static INT).
+        # Legacy TorchScript exporter (dynamo=False) traces with concrete B=1,
+        # baking groups=1 as a static constant throughout the graph.
+        # Dynamic batch is fundamentally incompatible with groups=B, so we
+        # export static batch=1 (evaluator generates one image at a time).
+        dummy_z = torch.randn(1, self.z_dim, device=device)
 
         wrapper = _NoNoiseWrapper(self)
         wrapper.eval()
@@ -295,8 +303,8 @@ class StyleGAN2Generator(nn.Module):
             opset_version=17,
             input_names=["z"],
             output_names=["image"],
-            dynamic_axes={"z": {0: "batch"}, "image": {0: "batch"}},
             do_constant_folding=True,
+            dynamo=False,
         )
 
         # Count and verify ONNX parameters
