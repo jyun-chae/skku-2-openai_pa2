@@ -139,3 +139,42 @@ class ToRGB(nn.Module):
 
     def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         return self.conv(x, w) + self.bias
+
+
+class SqueezeConnection(nn.Module):
+    """Image squeeze connection from StyleGAN-Small (arXiv:2407.05527).
+
+    Replaces the second ModulatedConv2d + ToRGB per block with a
+    squeeze-excitation path that reduces the toRGB information bottleneck:
+      1. Squeeze  : EqualConv2d(in_ch → in_ch//ratio, k=3)
+      2. Noise    : NoiseInjection on squeezed features (restores conv2 stochasticity)
+      3. ToRGB    : generate RGB from squeezed features
+      4. Excite   : EqualConv2d(in_ch//ratio → in_ch, k=3)
+      5. Project  : EqualConv2d(2*in_ch → in_ch, k=1) on cat(x, excited)
+
+    The projected output replaces x for the next block, enriching the
+    feature flow while using fewer parameters than conv2+ToRGB.
+    """
+
+    def __init__(self, in_ch: int, w_dim: int, ratio: int = 8) -> None:
+        super().__init__()
+        s_ch = max(in_ch // ratio, 8)
+        self.squeeze = EqualConv2d(in_ch, s_ch, kernel=3, padding=1)
+        self.noise   = NoiseInjection()
+        self.to_rgb  = ToRGB(s_ch, w_dim)
+        self.excite  = EqualConv2d(s_ch, in_ch, kernel=3, padding=1)
+        self.proj    = EqualConv2d(in_ch * 2, in_ch, kernel=1)
+        self.act     = nn.LeakyReLU(0.2)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        w: torch.Tensor,
+        noise: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x_s   = self.act(self.squeeze(x)) * math.sqrt(2)
+        x_s   = self.noise(x_s, noise)
+        rgb   = self.to_rgb(x_s, w)
+        x_e   = self.act(self.excite(x_s)) * math.sqrt(2)
+        x_out = self.proj(torch.cat([x, x_e], dim=1))
+        return x_out, rgb

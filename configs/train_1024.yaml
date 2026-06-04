@@ -2,9 +2,9 @@
 resolution: 1024
 z_dim: 512
 w_dim: 640
-channel_base: 65536
+channel_base: 131072
 channel_max: 512
-mapping_layers: 8
+mapping_layers: 12
 mapping_lr_mul: 0.01
 
 lr_g: 0.001
@@ -13,7 +13,7 @@ grad_clip: 1.0
 
 d_reg_interval: 16
 g_reg_interval: 4
-r1_gamma: 100.0
+r1_gamma: 50.0
 pl_weight: 2.0
 pl_decay: 0.01
 pl_warmup_steps: 500  # mean_path_length is NOT transferred from 512 ckpt (starts at 0)

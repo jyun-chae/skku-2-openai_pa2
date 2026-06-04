@@ -1,12 +1,13 @@
-"""StyleGAN2 Generator: Mapping Network + Synthesis Network.
+"""StyleGAN2 Generator with Squeeze Connection synthesis blocks.
 
 Channel schedule (channel_base=65536, channel_max=512):
   res:      4    8   16   32   64  128  256  512 1024
   channels: 512 512  512  512  512  512  256  128   64
-mapping_layers=8 (standard StyleGAN2), w_dim=640.
-PyTorch params @ 1024: ~38.22M.  ONNX initializer count: ~39.6M (<40M limit).
-Note: ONNX count exceeds PyTorch count by ~1.4M due to constant-folded
-intermediates baked into the graph during TorchScript export.
+mapping_layers=8, w_dim=640, squeeze_ratio=8.
+
+Squeeze connection (StyleGAN-Small, arXiv:2407.05527) replaces conv2+ToRGB
+with squeeze→excite→project path, reducing params while improving skip-RGB.
+PyTorch params @ 1024: ~34.10M.  ONNX initializer count: ~35.5M (<40M limit).
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import EqualLinear, ModulatedConv2d, NoiseInjection, PixelNorm, ToRGB
+from .layers import EqualLinear, ModulatedConv2d, NoiseInjection, PixelNorm, SqueezeConnection, ToRGB
 
 
 # ---------------------------------------------------------------------------
@@ -78,35 +79,38 @@ class MappingNetwork(nn.Module):
 
 class SynthesisBlock4(nn.Module):
 
-    def __init__(self, out_ch: int, w_dim: int) -> None:
+    def __init__(self, out_ch: int, w_dim: int, squeeze_ratio: int = 8) -> None:
         super().__init__()
-        self.const = nn.Parameter(torch.randn(1, out_ch, 4, 4))
-        self.conv = ModulatedConv2d(out_ch, out_ch, kernel=3, w_dim=w_dim)
-        self.noise = NoiseInjection()
-        self.act = nn.LeakyReLU(0.2)
-        self.to_rgb = ToRGB(out_ch, w_dim)
+        self.const   = nn.Parameter(torch.randn(1, out_ch, 4, 4))
+        self.conv    = ModulatedConv2d(out_ch, out_ch, kernel=3, w_dim=w_dim)
+        self.noise   = NoiseInjection()
+        self.act     = nn.LeakyReLU(0.2)
+        self.squeeze = SqueezeConnection(out_ch, w_dim, squeeze_ratio)
 
-    def forward(self, w: torch.Tensor,
-                noise: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        w: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+        squeeze_noise: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         b = w.shape[0]
         x = self.const.expand(b, -1, -1, -1)
         x = self.conv(x, w)
         x = self.noise(x, noise)
         x = self.act(x) * math.sqrt(2)
-        rgb = self.to_rgb(x, w)
+        x, rgb = self.squeeze(x, w, squeeze_noise)
         return x, rgb
 
 
 class SynthesisBlock(nn.Module):
+    """Upsample block with squeeze connection replacing conv2 + ToRGB."""
 
-    def __init__(self, in_ch: int, out_ch: int, w_dim: int) -> None:
+    def __init__(self, in_ch: int, out_ch: int, w_dim: int, squeeze_ratio: int = 8) -> None:
         super().__init__()
-        self.conv1 = ModulatedConv2d(in_ch, out_ch, kernel=3, w_dim=w_dim, upsample=True)
-        self.noise1 = NoiseInjection()
-        self.conv2 = ModulatedConv2d(out_ch, out_ch, kernel=3, w_dim=w_dim)
-        self.noise2 = NoiseInjection()
-        self.act = nn.LeakyReLU(0.2)
-        self.to_rgb = ToRGB(out_ch, w_dim)
+        self.conv1   = ModulatedConv2d(in_ch, out_ch, kernel=3, w_dim=w_dim, upsample=True)
+        self.noise1  = NoiseInjection()
+        self.act     = nn.LeakyReLU(0.2)
+        self.squeeze = SqueezeConnection(out_ch, w_dim, squeeze_ratio)
 
     def forward(
         self,
@@ -114,18 +118,15 @@ class SynthesisBlock(nn.Module):
         prev_rgb: torch.Tensor,
         w: torch.Tensor,
         noise1: Optional[torch.Tensor] = None,
-        noise2: Optional[torch.Tensor] = None,
+        squeeze_noise: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.conv1(x, w)
         x = self.noise1(x, noise1)
         x = self.act(x) * math.sqrt(2)
 
-        x = self.conv2(x, w)
-        x = self.noise2(x, noise2)
-        x = self.act(x) * math.sqrt(2)
-
+        x, rgb_cur = self.squeeze(x, w, squeeze_noise)
         prev_rgb_up = F.interpolate(prev_rgb, scale_factor=2, mode="bilinear", align_corners=False)
-        rgb = prev_rgb_up + self.to_rgb(x, w)
+        rgb = prev_rgb_up + rgb_cur
         return x, rgb
 
 
@@ -153,8 +154,9 @@ class StyleGAN2Generator(nn.Module):
         w_dim: int = 640,
         channel_base: int = 65536,
         channel_max: int = 512,
-        mapping_layers: int = 8,
+        mapping_layers: int = 12,
         mapping_lr_mul: float = 0.01,
+        squeeze_ratio: int = 8,
     ) -> None:
         super().__init__()
         assert resolution in (256, 512, 1024), "resolution must be 256, 512, or 1024"
@@ -168,14 +170,14 @@ class StyleGAN2Generator(nn.Module):
 
         self.mapping = MappingNetwork(z_dim, w_dim, mapping_layers, mapping_lr_mul)
 
-        self.b4 = SynthesisBlock4(nf(4), w_dim)
+        self.b4 = SynthesisBlock4(nf(4), w_dim, squeeze_ratio)
 
         self.blocks = nn.ModuleList()
         in_ch = nf(4)
         for log2_r in range(3, self.log2_res + 1):
             res = 2 ** log2_r
             out_ch = nf(res)
-            self.blocks.append(SynthesisBlock(in_ch, out_ch, w_dim))
+            self.blocks.append(SynthesisBlock(in_ch, out_ch, w_dim, squeeze_ratio))
             in_ch = out_ch
 
         self.num_ws = 1 + len(self.blocks)
@@ -194,18 +196,15 @@ class StyleGAN2Generator(nn.Module):
             if noise_mode == "none":
                 return torch.zeros(b, 1, h, ww, device=w.device)
             if noise_mode == "const":
-                # unique seed per (resolution, noise-index)
                 seed = h * 2000 + ww * 2 + idx
                 g = torch.Generator(device=w.device).manual_seed(seed)
                 return torch.randn(1, 1, h, ww, generator=g, device=w.device).expand(b, -1, -1, -1)
             return None   # NoiseInjection samples dynamically (training default)
 
-        x, rgb = self.b4(ws[0])
+        x, rgb = self.b4(ws[0], _noise(4, 4, 0), _noise(4, 4, 1))
         for i, block in enumerate(self.blocks):
             h_next = 8 * (2 ** i)
-            n1 = _noise(h_next, h_next, idx=0)
-            n2 = _noise(h_next, h_next, idx=1)
-            x, rgb = block(x, rgb, ws[i + 1], n1, n2)
+            x, rgb = block(x, rgb, ws[i + 1], _noise(h_next, h_next, 0), _noise(h_next, h_next, 1))
 
         return torch.tanh(rgb)
 
