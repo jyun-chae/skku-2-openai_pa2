@@ -1,11 +1,4 @@
-"""StyleGAN2 core building blocks with equalized learning rate.
-
-Equalized LR (He init at runtime):
-  Weights are stored as N(0,1). The per-layer scale factor c = 1/sqrt(fan_in)
-  is applied at *forward time* instead of at init. This keeps weight magnitudes
-  uniform at initialization and ensures all parameters receive equal effective
-  learning rates regardless of their fan-in.
-"""
+"""StyleGAN2 core layers with equalized learning rate."""
 
 from __future__ import annotations
 
@@ -17,27 +10,12 @@ import torch.nn.functional as F
 
 
 class PixelNorm(nn.Module):
-    """Pixel-wise L2 normalization on the channel dimension (used in mapping network).
-
-    Prevents the latent z from growing unbounded before the mapping MLP.
-    StyleGAN2 applies this only to the mapping network input, not to synthesis.
-    """
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(dim=1, keepdim=True) + 1e-8)
 
 
 class EqualLinear(nn.Module):
-    """Fully-connected layer with equalized learning rate.
-
-    Args:
-        lr_mul: Multiplier that lets the mapping network use a lower effective LR
-                (typically 0.01) than the rest of the model. The weight is divided
-                by lr_mul at init and multiplied back at forward time, so the
-                gradient flowing to the stored weight is lr_mul × smaller.
-        bias_init: Non-zero default (1.0) is used for modulation affines so that
-                   the initial style is close to the identity transform.
-    """
+    """Linear layer with equalized learning rate."""
 
     def __init__(
         self,
@@ -93,22 +71,7 @@ class EqualConv2d(nn.Module):
 
 
 class ModulatedConv2d(nn.Module):
-    """StyleGAN2 modulated convolution with weight demodulation.
-
-    Forward pass:
-      1. style  = affine(w)                      # per-sample channel scales
-      2. weight = base_weight * scale * style    # modulate
-      3. weight = weight / norm(weight)           # demodulate (unit std per output)
-      4. output = grouped_conv(x, weight)        # one group per sample
-
-    The group-conv trick avoids a loop over the batch: we reshape x to
-    [1, B*C, H, W] and weight to [B*out, C, k, k], then run a single conv
-    with groups=B so each sample uses its own (modulated) filters.
-
-    Upsample mode: bilinear ×2 is applied to x BEFORE the convolution.
-    This is equivalent to transposed conv + blur and avoids the tricky
-    kernel flip that transposed conv requires for correct equalized LR.
-    """
+    """StyleGAN2 per-sample weight modulation + demodulation conv."""
 
     def __init__(
         self,
@@ -135,13 +98,10 @@ class ModulatedConv2d(nn.Module):
     def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         b, c, h, width = x.shape
 
-        style = self.affine(w).view(b, 1, c, 1, 1)       # [B, 1, in, 1, 1]
-        weight = self.weight * self.scale * style          # [B, out, in, k, k]
+        style = self.affine(w).view(b, 1, c, 1, 1)
+        weight = self.weight * self.scale * style
 
         if self.demodulate:
-            # Demodulation normalizes each output filter to unit std so that
-            # the modulation effect is purely directional, not scale-changing.
-            #
             # MUST run in fp32: fp16 accumulates (in_ch * k²) squares.
             # With 512 channels and 3×3 kernel that is 4608 terms; values
             # around 10 give 10² × 4608 ≈ 460k, well above fp16 max (65504).
@@ -154,7 +114,6 @@ class ModulatedConv2d(nn.Module):
             x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
             h, width = x.shape[2], x.shape[3]
 
-        # Group-conv: treat each sample as an independent group
         x = x.reshape(1, b * c, h, width)
         weight = weight.reshape(b * self.out_ch, c, self.kernel, self.kernel)
         x = F.conv2d(x, weight, padding=self.padding, groups=b)
@@ -162,12 +121,6 @@ class ModulatedConv2d(nn.Module):
 
 
 class NoiseInjection(nn.Module):
-    """Add spatially-correlated Gaussian noise scaled by a learnable scalar.
-
-    The network uses noise to control stochastic per-pixel detail (hair strands,
-    skin pores) without affecting global structure — the small learned weight
-    keeps noise contribution negligible early in training.
-    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -181,12 +134,6 @@ class NoiseInjection(nn.Module):
 
 
 class ToRGB(nn.Module):
-    """1×1 modulated conv that projects feature maps to 3-channel RGB.
-
-    demodulate=False: the modulation acts as a per-sample color calibration;
-    demodulation would cancel that effect, so it is intentionally disabled.
-    The resulting output feeds into the skip-RGB accumulation (sum across blocks).
-    """
 
     def __init__(self, in_ch: int, w_dim: int) -> None:
         super().__init__()

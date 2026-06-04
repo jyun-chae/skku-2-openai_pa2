@@ -1,11 +1,4 @@
-"""StyleGAN2 Discriminator.
-
-Residual architecture with:
-  - Equalized learning rate
-  - Minibatch standard deviation (at 4×4)
-  - Downsampling via strided conv + average pooling (ResBlock pattern)
-  - No requirements on parameter count (only G is constrained).
-"""
+"""StyleGAN2 Discriminator with residual blocks, minibatch stddev, and R1 regularization."""
 
 from __future__ import annotations
 
@@ -31,7 +24,6 @@ def _nf(resolution: int, channel_base: int = 32768, channel_max: int = 512) -> i
 # ---------------------------------------------------------------------------
 
 class MinibatchStddev(nn.Module):
-    """Appends a summary stddev feature map to expose mode collapse."""
 
     def __init__(self, group_size: int = 4, num_features: int = 1) -> None:
         super().__init__()
@@ -53,7 +45,6 @@ class MinibatchStddev(nn.Module):
 
 
 class DiscBlock(nn.Module):
-    """Residual discriminator block (resolution halved)."""
 
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
@@ -73,7 +64,6 @@ class DiscBlock(nn.Module):
 
 
 class FromRGB(nn.Module):
-    """Project 3-channel image to feature space."""
 
     def __init__(self, out_ch: int) -> None:
         super().__init__()
@@ -117,14 +107,13 @@ class StyleGAN2Discriminator(nn.Module):
 
         blocks = []
         in_ch = nf(resolution)
-        for log2_r in range(log2_res, 2, -1):   # resolution → 8
+        for log2_r in range(log2_res, 2, -1):
             res = 2 ** log2_r
             out_ch = nf(res // 2)
             blocks.append(DiscBlock(in_ch, out_ch))
             in_ch = out_ch
         self.blocks = nn.ModuleList(blocks)
 
-        # Final 4×4 block
         self.mbstd = MinibatchStddev(mbstd_group)
         self.conv_4 = EqualConv2d(in_ch + 1, in_ch, kernel=3, padding=1)
         self.act = nn.LeakyReLU(0.2)
@@ -143,29 +132,19 @@ class StyleGAN2Discriminator(nn.Module):
         return self.out(feat)
 
     def load_from_lower_resolution(self, state_dict: dict) -> None:
-        """Load D weights from a lower-resolution checkpoint.
-
-        When resolution doubles, the new D gains:
-          - A new from_rgb for the higher input resolution  (random-init)
-          - A new blocks[0] for the first downsampling step (random-init)
-          - Old blocks[i] → new blocks[i+1]                (loaded)
-          - Final layers (mbstd, conv_4, fc, out) stay the same shape (loaded)
-        """
+        """Load D weights from a lower-resolution checkpoint; new from_rgb and blocks[0] stay random-init."""
         own = self.state_dict()
         new_state: dict = {}
 
         for k, v in state_dict.items():
             if k.startswith('from_rgb.') or k.startswith('blocks.0.'):
-                # New layers introduced at the higher resolution — keep random init
                 continue
             elif k.startswith('blocks.'):
-                # Shift block index by +1: old blocks[i] → new blocks[i+1]
                 parts = k.split('.')
                 new_key = f'blocks.{int(parts[1]) + 1}.' + '.'.join(parts[2:])
                 if new_key in own and own[new_key].shape == v.shape:
                     new_state[new_key] = v
             else:
-                # mbstd, conv_4, act, fc, out — same shape across resolutions
                 if k in own and own[k].shape == v.shape:
                     new_state[k] = v
 

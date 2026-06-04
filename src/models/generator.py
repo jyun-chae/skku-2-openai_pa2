@@ -1,10 +1,5 @@
 """StyleGAN2 Generator: Mapping Network + Synthesis Network.
 
-Progressive training flow:
-  256  → train from scratch
-  512  → load 256 weights, random-init new block
-  1024 → load 512 weights, random-init new block
-
 Channel schedule (channel_base=65536, channel_max=512):
   res:      4    8   16   32   64  128  256  512 1024
   channels: 512 512  512  512  512  512  256  128   64
@@ -12,14 +7,6 @@ mapping_layers=8 (standard StyleGAN2), w_dim=640.
 PyTorch params @ 1024: ~38.22M.  ONNX initializer count: ~39.6M (<40M limit).
 Note: ONNX count exceeds PyTorch count by ~1.4M due to constant-folded
 intermediates baked into the graph during TorchScript export.
-
-Design notes:
-  - Mapping network uses lr_mul=0.01 so it trains ~100× slower than synthesis.
-    This prevents the mapping from collapsing to a trivial solution early on.
-  - _synthesis is split from forward so PL regularization can supply w directly
-    as a leaf node (differentiating synthesis only, not the mapping network).
-  - Skip-RGB architecture: each block adds a bilinearly upsampled RGB contribution;
-    the final image is the accumulated sum passed through tanh.
 """
 
 from __future__ import annotations
@@ -52,11 +39,7 @@ def _log2(n: int) -> int:
 # ---------------------------------------------------------------------------
 
 class MappingNetwork(nn.Module):
-    """Maps latent z → disentangled latent w.
-
-    Follows StyleGAN2: 8-layer EqualLinear MLP with PixelNorm on input and
-    a reduced learning rate multiplier (lr_mul=0.01) for stability.
-    """
+    """Maps z → disentangled w via an 8-layer EqualLinear MLP."""
 
     def __init__(
         self,
@@ -94,7 +77,6 @@ class MappingNetwork(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SynthesisBlock4(nn.Module):
-    """Initial 4×4 constant block."""
 
     def __init__(self, out_ch: int, w_dim: int) -> None:
         super().__init__()
@@ -116,11 +98,9 @@ class SynthesisBlock4(nn.Module):
 
 
 class SynthesisBlock(nn.Module):
-    """Upsampling synthesis block (resolution doubles)."""
 
     def __init__(self, in_ch: int, out_ch: int, w_dim: int) -> None:
         super().__init__()
-        # First conv: upsample ×2 inside ModulatedConv2d
         self.conv1 = ModulatedConv2d(in_ch, out_ch, kernel=3, w_dim=w_dim, upsample=True)
         self.noise1 = NoiseInjection()
         self.conv2 = ModulatedConv2d(out_ch, out_ch, kernel=3, w_dim=w_dim)
@@ -144,7 +124,6 @@ class SynthesisBlock(nn.Module):
         x = self.noise2(x, noise2)
         x = self.act(x) * math.sqrt(2)
 
-        # Skip RGB: upsample previous, add this block's contribution
         prev_rgb_up = F.interpolate(prev_rgb, scale_factor=2, mode="bilinear", align_corners=False)
         rgb = prev_rgb_up + self.to_rgb(x, w)
         return x, rgb
@@ -155,7 +134,7 @@ class SynthesisBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class StyleGAN2Generator(nn.Module):
-    """StyleGAN2 Generator supporting resolutions 256 / 512 / 1024.
+    """StyleGAN2 generator with skip-RGB synthesis and mapping network.
 
     Args:
         resolution:    Target output resolution (256, 512, or 1024).
@@ -182,27 +161,24 @@ class StyleGAN2Generator(nn.Module):
         self.resolution = resolution
         self.z_dim = z_dim
         self.w_dim = w_dim
-        self.log2_res = _log2(resolution)          # 8, 9, or 10
+        self.log2_res = _log2(resolution)
 
         def nf(r: int) -> int:
             return _nf(r, channel_base, channel_max)
 
         self.mapping = MappingNetwork(z_dim, w_dim, mapping_layers, mapping_lr_mul)
 
-        # 4×4 initial block
         self.b4 = SynthesisBlock4(nf(4), w_dim)
 
-        # Upsampling blocks: 8, 16, 32, ..., resolution
         self.blocks = nn.ModuleList()
         in_ch = nf(4)
-        for log2_r in range(3, self.log2_res + 1):   # 3→8, 4→16, ..., log2_res→resolution
+        for log2_r in range(3, self.log2_res + 1):
             res = 2 ** log2_r
             out_ch = nf(res)
             self.blocks.append(SynthesisBlock(in_ch, out_ch, w_dim))
             in_ch = out_ch
 
-        # Total synthesis layers = 1 (b4) + len(blocks)
-        self.num_ws = 1 + len(self.blocks)   # one w per layer (broadcast)
+        self.num_ws = 1 + len(self.blocks)
 
     # ------------------------------------------------------------------
     def _w_broadcast(self, w: torch.Tensor) -> list[torch.Tensor]:
@@ -218,9 +194,7 @@ class StyleGAN2Generator(nn.Module):
             if noise_mode == "none":
                 return torch.zeros(b, 1, h, ww, device=w.device)
             if noise_mode == "const":
-                # Unique seed per (resolution, conv-index) so that:
-                #   - n1 and n2 within the same block have different patterns
-                #   - patterns are reproducible across calls (same seed = same output)
+                # unique seed per (resolution, noise-index)
                 seed = h * 2000 + ww * 2 + idx
                 g = torch.Generator(device=w.device).manual_seed(seed)
                 return torch.randn(1, 1, h, ww, generator=g, device=w.device).expand(b, -1, -1, -1)
@@ -264,19 +238,11 @@ class StyleGAN2Generator(nn.Module):
 
     # ------------------------------------------------------------------
     def export_onnx(self, path: str, batch_size: int = 1) -> int:
-        """Export generator to ONNX with zero noise for a deterministic graph.
-
-        Uses a thin wrapper so `noise_mode` is baked into the traced graph
-        rather than passed as a dynamic Python kwarg (which ONNX cannot represent).
-
-        Returns:
-            Total ONNX parameter count (sum of initializer elements).
-        """
+        """Export generator to ONNX with zero noise for a deterministic graph."""
         import numpy as np
         import onnx
 
         class _NoNoiseWrapper(nn.Module):
-            """Wraps generator with fixed noise_mode='none' for ONNX tracing."""
             def __init__(self, G: "StyleGAN2Generator") -> None:
                 super().__init__()
                 self.G = G
@@ -288,10 +254,7 @@ class StyleGAN2Generator(nn.Module):
 
         wrapper = _NoNoiseWrapper(self)
         wrapper.eval()
-        # Move to CPU for export: do_constant_folding=True mixes GPU model
-        # tensors with CPU intermediates during the JIT constant-folding pass,
-        # causing "Expected all tensors on same device" RuntimeError on CUDA.
-        # CPU export avoids this; we restore the original device afterwards.
+        # CPU: do_constant_folding mixes GPU tensors with CPU intermediates → RuntimeError on CUDA.
         wrapper.cpu()
         dummy_z = torch.randn(1, self.z_dim, device="cpu")
 
@@ -303,11 +266,10 @@ class StyleGAN2Generator(nn.Module):
             input_names=["z"],
             output_names=["image"],
             do_constant_folding=True,
-            dynamo=False,
+            dynamo=False,  # dynamo path uses groups=B which ONNX opset 17 cannot represent
         )
         wrapper.to(device)
 
-        # Count and verify ONNX parameters
         model_onnx = onnx.load(path)
         onnx_params = sum(int(np.prod(t.dims)) for t in model_onnx.graph.initializer)
         limit = 40_000_000
@@ -321,7 +283,7 @@ class StyleGAN2Generator(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def load_from_lower_resolution(self, state_dict: dict) -> None:
-        """Load weights from a lower-resolution checkpoint (new blocks stay random)."""
+        """Load weights from a lower-resolution checkpoint; new higher-res blocks stay random-init."""
         own = self.state_dict()
         filtered = {k: v for k, v in state_dict.items() if k in own and own[k].shape == v.shape}
         own.update(filtered)

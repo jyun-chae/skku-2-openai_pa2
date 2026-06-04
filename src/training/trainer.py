@@ -1,15 +1,4 @@
-"""StyleGAN2 Trainer.
-
-Features:
-  - Non-saturating logistic D/G loss
-  - R1 gradient penalty (lazy, every d_reg_interval steps)
-  - Path-length regularization (lazy, every g_reg_interval steps)
-  - Gradient clipping on Generator
-  - Mixed-precision (torch.amp) for A100
-  - WandB logging: D/G loss, real/fake score, score_gap, sample images
-  - FID evaluation on validation set (pytorch-fid)
-  - Google Drive checkpoint backup
-"""
+"""StyleGAN2 training loop with lazy R1/PL regularization, AMP, and Drive checkpoint backup."""
 
 from __future__ import annotations
 
@@ -41,11 +30,7 @@ from ..utils.fid_score import ValidFIDCache
 # ---------------------------------------------------------------------------
 
 class Trainer:
-    """StyleGAN2 training loop.
-
-    Args:
-        cfg: Config namespace / dict-like (use types.SimpleNamespace or argparse.Namespace).
-    """
+    """StyleGAN2 trainer. cfg must have the fields defined in configs/train_*.yaml."""
 
     def __init__(self, cfg) -> None:
         self.cfg = cfg
@@ -117,9 +102,6 @@ class Trainer:
 
     def d_step(self, real_img: torch.Tensor) -> dict:
         cfg = self.cfg
-        # Freeze G so its parameters don't accumulate unused gradients.
-        # D.requires_grad_(True) is redundant here (it's the default) but
-        # makes the intent explicit after the previous g_step froze D.
         self.D.requires_grad_(True)
         self.G.requires_grad_(False)
 
@@ -144,16 +126,11 @@ class Trainer:
             "D/real_score": real_score,
             "D/fake_score": fake_score,
             "D/score_gap": real_score - fake_score,
-            # Sigmoid-scaled versions: should both converge toward 0.5 at equilibrium.
-            # Easier to read than raw logits (bounded in [0, 1]).
             "D/real_score_sig": torch.sigmoid(real_pred).mean().item(),
             "D/fake_score_sig": torch.sigmoid(fake_pred).mean().item(),
         }
 
-        # Lazy R1 regularization — must run in fp32.
-        # Reason: autograd.grad inside autocast returns fp16 gradients whose
-        # pow(2).sum() over 3×H×W pixels easily overflows fp16 (max 65504),
-        # producing inf/NaN in the penalty before GradScaler can catch it.
+        # R1 must run in fp32: fp16 grad.pow(2) overflows (4608 terms → inf), rsqrt(inf)=0 kills D.
         if self.step % cfg.d_reg_interval == 0:
             real_img_r1 = real_img.detach().float().requires_grad_(True)
             with autocast("cuda", enabled=False):
@@ -162,7 +139,7 @@ class Trainer:
                 r1_loss = (cfg.r1_gamma / 2) * r1_penalty * cfg.d_reg_interval
 
             self.d_optim.zero_grad(set_to_none=True)
-            r1_loss.backward()          # fp32 backward — no scaler needed
+            r1_loss.backward()
             nn.utils.clip_grad_norm_(self.D.parameters(), max_norm=cfg.grad_clip)
             self.d_optim.step()
             logs["D/r1_penalty"] = r1_penalty.item()
@@ -171,9 +148,6 @@ class Trainer:
 
     def g_step(self) -> dict:
         cfg = self.cfg
-        # Freeze D to skip computing its parameter gradients during G's forward.
-        # The frozen D still participates in the forward pass (needed for the loss),
-        # but no D gradients are materialised, saving ~half the backward memory.
         self.D.requires_grad_(False)
         self.G.requires_grad_(True)
 
@@ -200,23 +174,14 @@ class Trainer:
                 "G/img_std": img_stats.std().item(),
             }
 
-        # Lazy path-length regularization
-        # Skip the first pl_warmup_steps: mean_path_length starts at 0, so the
-        # target is 0 and pl_loss = pl_lengths² which can be 25-100+. This pushes
-        # G to reduce sensitivity to w immediately (→ solid-color mode collapse).
-        # After warmup the EMA has a realistic target and PL stabilises training.
+        # Skip PL until step >= pl_warmup: mean_path_length starts at 0, making pl_loss=pl_lengths² at init.
         pl_warmup = getattr(cfg, "pl_warmup_steps", 0)
         if self.step % cfg.g_reg_interval == 0 and self.step >= pl_warmup:
             z_pl = self._sample_z(max(1, cfg.batch_size // 2))
-            # PL reg differentiates the *synthesis* network w.r.t. w only —
-            # not the mapping network. Reason: we want the synthesis Jacobian
-            # to be well-conditioned; the mapping is already regularised by
-            # its slower lr_mul and the disentanglement objective.
-            # Strategy: run mapping under no_grad, then make w a leaf node.
+            # Differentiate synthesis only: run mapping under no_grad, make w a leaf.
             with torch.no_grad():
                 w_pl = self.G.mapping(z_pl)
-            w_pl = w_pl.detach().requires_grad_(True)   # leaf → only synthesis is differentiated
-            # fp32 for stable Frobenius norm computation (grad² sums are large)
+            w_pl = w_pl.detach().requires_grad_(True)
             with autocast("cuda", enabled=False):
                 fake_img_pl = self.G(w=w_pl, noise_mode="random").float()
                 pl_loss, self.mean_path_length, pl_lengths = g_path_length_loss(
@@ -248,22 +213,14 @@ class Trainer:
         ckpt_dir: str = "checkpoints",
         fid_cache: Optional["ValidFIDCache"] = None,
     ) -> None:
-        """Main training loop.
-
-        Args:
-            fid_cache: Pre-built ValidFIDCache (real stats computed once).
-                       If None, stats are recomputed at each FID evaluation step.
-        """
         cfg = self.cfg
         Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
         loader_iter = _infinite(train_loader)
         total_steps = cfg.total_kimg * 1000 // cfg.batch_size
 
-        # LR values are constant (no scheduler); read once for logging
         lr_g = self.g_optim.param_groups[0]["lr"]
         lr_d = self.d_optim.param_groups[0]["lr"]
 
-        # Build FID cache now if not provided
         if fid_cache is None:
             fid_cache = ValidFIDCache(valid_loader, self.device)
 
@@ -285,27 +242,19 @@ class Trainer:
                 "step_time_s": time.perf_counter() - t0,
             }
 
-            # ----------------------------------------------------------
-            # Logging
-            # ----------------------------------------------------------
+            # — logging —
             if self.step % cfg.log_interval == 0:
                 kimg = self.step * cfg.batch_size / 1000
                 _print_logs(self.step, kimg, logs)
 
                 if wandb_run is not None:
-                    # Pass step= as a kwarg so WandB uses the actual training
-                    # step as the x-axis (not its internal log-call counter).
                     wandb_run.log({"kimg": kimg, **logs}, step=self.step)
 
-            # ----------------------------------------------------------
-            # Sample images → WandB
-            # ----------------------------------------------------------
+            # — samples —
             if self.step % cfg.sample_interval == 0 and wandb_run is not None:
                 self._log_samples(wandb_run, n=16)
 
-            # ----------------------------------------------------------
-            # FID on valid set (uses pre-cached real statistics)
-            # ----------------------------------------------------------
+            # — FID —
             if self.step % cfg.fid_interval == 0 and self.step > 0:
                 fid = fid_cache.compute(
                     self.G,
@@ -316,9 +265,7 @@ class Trainer:
                 if wandb_run is not None:
                     wandb_run.log({"FID": fid}, step=self.step)
 
-            # ----------------------------------------------------------
-            # Checkpoint
-            # ----------------------------------------------------------
+            # — checkpoint —
             if self.step % cfg.save_interval == 0 and self.step > 0:
                 path = os.path.join(ckpt_dir, f"ckpt_{cfg.resolution}_{self.step:07d}.pth")
                 wandb_id = wandb_run.id if wandb_run is not None else None
@@ -352,7 +299,7 @@ class Trainer:
         print(f"  [ckpt] saved → {path}")
 
     def load(self, path: str, strict: bool = True) -> Optional[str]:
-        """Load checkpoint. Returns the saved WandB run ID (or None) for run resumption."""
+        """Load checkpoint, return saved WandB run ID."""
         state = torch.load(path, map_location=self.device)
         self.G.load_state_dict(state["G"], strict=strict)
         self.D.load_state_dict(state["D"], strict=strict)
@@ -419,11 +366,7 @@ def _backup_to_drive(src: str, drive_dir: str) -> None:
 
 
 def find_latest_checkpoint(drive_ckpt_dir: str, resolution: int) -> Optional[str]:
-    """Return the path of the most recent checkpoint for `resolution` in Drive.
-
-    Priority: *_final.pth > highest-step numbered file > None (no checkpoint).
-    Call this before training to detect if a previous session left a backup.
-    """
+    """Return the most recent checkpoint path for `resolution` in Drive, or None."""
     import glob
     finals = glob.glob(os.path.join(drive_ckpt_dir, f"ckpt_{resolution}_final.pth"))
     if finals:
@@ -438,15 +381,7 @@ def restore_from_drive(
     local_ckpt_dir: str,
     resolution: int,
 ) -> bool:
-    """Copy the latest Drive checkpoint to local disk and load it into trainer.
-
-    Returns True if a checkpoint was found and loaded, False if starting fresh.
-
-    Usage in notebook:
-        resumed = restore_from_drive(trainer, DRIVE_CKPT_DIR, CKPT_DIR, 256)
-        if not resumed:
-            # first run: load weights from previous stage, etc.
-    """
+    """Copy the latest Drive checkpoint to local disk and load it; return False if none found."""
     drive_path = find_latest_checkpoint(drive_ckpt_dir, resolution)
     if drive_path is None:
         print(f"  [restore] No checkpoint found in {drive_ckpt_dir} for res={resolution} → starting fresh.")
