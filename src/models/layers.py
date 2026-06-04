@@ -37,10 +37,7 @@ class EqualLinear(nn.Module):
         bias = self.bias * self.lr_mul if self.bias is not None else None
         out = F.linear(x, self.weight * self.scale, bias)
         if self.activation == "fused_lrelu":
-            # sqrt(2) restores unit variance after LeakyReLU (negative slope 0.2
-            # kills ~10% of variance; sqrt(2) over-compensates slightly but matches
-            # the official StyleGAN2 implementation).
-            out = F.leaky_relu(out, 0.2) * math.sqrt(2)
+            out = F.leaky_relu(out, 0.2) * math.sqrt(2)  # sqrt(2) restores ~unit variance post-LReLU (matches official impl)
         return out
 
 

@@ -294,7 +294,7 @@ class Trainer:
             "d_optim": self.d_optim.state_dict(),
             "mean_path_length": self.mean_path_length,
             "cfg": vars(self.cfg) if hasattr(self.cfg, "__dict__") else dict(self.cfg),
-            "wandb_run_id": wandb_run_id,   # saved so WandB can resume the same run
+            "wandb_run_id": wandb_run_id,
         }, path)
         print(f"  [ckpt] saved → {path}")
 
