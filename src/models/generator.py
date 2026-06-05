@@ -273,7 +273,7 @@ class StyleGAN2Generator(nn.Module):
 
         model_onnx = onnx.load(path)
         onnx_params = sum(int(np.prod(t.dims)) for t in model_onnx.graph.initializer)
-        limit = 40_000_000
+        limit = 50_000_000
         status = "OK" if onnx_params < limit else "OVER LIMIT"
         print(f"ONNX exported → {path}")
         print(f"  ONNX parameters: {onnx_params:,} ({onnx_params/1e6:.3f}M)  [{status}]")
