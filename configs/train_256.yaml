@@ -32,8 +32,8 @@ num_workers: 4
 total_kimg: 25000
 
 # Logging / evaluation
-log_interval: 100
-sample_interval: 500
+log_interval: 500
+sample_interval: 1000
 fid_interval: 5000
 save_interval: 5000
 n_fid_samples: 10000
