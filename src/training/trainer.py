@@ -306,6 +306,14 @@ class Trainer:
         if strict:
             self.g_optim.load_state_dict(state["g_optim"])
             self.d_optim.load_state_dict(state["d_optim"])
+            # load_state_dict restores saved LR, overriding cfg.  Re-apply cfg LR
+            # so that changing lr_g/lr_d in the yaml takes effect on resume.
+            g_ratio = self.cfg.g_reg_interval / (self.cfg.g_reg_interval + 1)
+            d_ratio = self.cfg.d_reg_interval / (self.cfg.d_reg_interval + 1)
+            for pg in self.g_optim.param_groups:
+                pg["lr"] = self.cfg.lr_g * g_ratio
+            for pg in self.d_optim.param_groups:
+                pg["lr"] = self.cfg.lr_d * d_ratio
             self.step = state["step"]
             self.mean_path_length = state.get("mean_path_length", self.mean_path_length)
         wandb_run_id = state.get("wandb_run_id")
