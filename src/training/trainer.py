@@ -93,6 +93,33 @@ class Trainer:
         self.g_scaler = GradScaler("cuda", enabled=self.cfg.use_amp)
         self.d_scaler = GradScaler("cuda", enabled=self.cfg.use_amp)
 
+    def rebuild_optimizers(self) -> None:
+        """Rebuild G/D optimizers from currently trainable (requires_grad=True) params.
+
+        Call after load_from_lower_resolution(freeze_existing=True) so that
+        frozen params are excluded from the optimizer state entirely.
+        """
+        cfg = self.cfg
+        g_ratio = cfg.g_reg_interval / (cfg.g_reg_interval + 1)
+        d_ratio = cfg.d_reg_interval / (cfg.d_reg_interval + 1)
+
+        g_params = [p for p in self.G.parameters() if p.requires_grad]
+        d_params = [p for p in self.D.parameters() if p.requires_grad]
+
+        self.g_optim = torch.optim.Adam(
+            g_params, lr=cfg.lr_g * g_ratio,
+            betas=(0.0, 0.99 ** g_ratio), eps=1e-8,
+        )
+        self.d_optim = torch.optim.Adam(
+            d_params, lr=cfg.lr_d * d_ratio,
+            betas=(0.0, 0.99 ** d_ratio), eps=1e-8,
+        )
+        self._setup_scalers()
+
+        g_trainable = sum(p.numel() for p in g_params)
+        d_trainable = sum(p.numel() for p in d_params)
+        print(f"[Trainer] Rebuilt optimizers — G trainable: {g_trainable:,}  D trainable: {d_trainable:,}")
+
     # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------

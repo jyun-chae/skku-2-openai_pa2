@@ -131,8 +131,15 @@ class StyleGAN2Discriminator(nn.Module):
         feat = self.act(self.fc(feat)) * math.sqrt(2)
         return self.out(feat)
 
-    def load_from_lower_resolution(self, state_dict: dict) -> None:
-        """Load D weights from a lower-resolution checkpoint; new from_rgb and blocks[0] stay random-init."""
+    def load_from_lower_resolution(self, state_dict: dict, freeze_existing: bool = False) -> None:
+        """Load D weights from a lower-resolution checkpoint; new from_rgb and blocks[0] stay random-init.
+
+        Args:
+            state_dict:      D state dict from the previous-stage checkpoint.
+            freeze_existing: If True, freeze all loaded params (requires_grad=False).
+                             Call trainer.rebuild_optimizers() afterwards so frozen
+                             params are excluded from the optimizer.
+        """
         own = self.state_dict()
         new_state: dict = {}
 
@@ -152,3 +159,12 @@ class StyleGAN2Discriminator(nn.Module):
         self.load_state_dict(own)
         print(f'D loaded {len(new_state)}/{len(own)} tensors '
               f'(new from_rgb + blocks.0 are random-init).')
+
+        if freeze_existing and new_state:
+            frozen = 0
+            for name, param in self.named_parameters():
+                if name in new_state:
+                    param.requires_grad_(False)
+                    frozen += 1
+            trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            print(f"  Froze {frozen} param tensors. D trainable: {trainable:,}")

@@ -1,0 +1,626 @@
+================================================================================
+  Project 02 — StyleGAN2 기반 고해상도 얼굴 이미지 생성기 보고서
+  1024×1024 FFHQ 얼굴 생성 / ONNX 제출
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+1. 개요
+────────────────────────────────────────────────────────────────────────────────
+
+본 프로젝트는 FFHQ(Flickr-Faces-HQ) 데이터셋을 사용하여 1024×1024 해상도의
+고품질 얼굴 이미지를 생성하는 무조건부(unconditional) GAN 모델을 구현합니다.
+
+기반 아키텍처는 StyleGAN2이며, 여기에 StyleGAN-Small 논문의 SqueezeConnection
+구조를 합성 블록에 적용하였습니다. 학습은 256 → 512 → 1024 해상도 순서의
+프로그레시브 트레이닝 방식으로 진행되었으며, 최종 Generator는 PyTorch 파라미터
+약 34.10M, ONNX initializer 약 35.5M으로 제출 한도(50M) 내에 수렴합니다.
+
+제출 형식:
+  - 입력: z, shape (N, 512), dtype float32
+  - 출력: shape (N, 3, 1024, 1024), dtype float32, range [-1, 1]
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. 참고 논문 및 사용한 특징
+────────────────────────────────────────────────────────────────────────────────
+
+[1] StyleGAN2 — Analyzing and Improving the Image Quality of StyleGAN
+    Karras et al., 2020 (https://arxiv.org/abs/1912.04958)
+
+    본 프로젝트의 핵심 기반 아키텍처. 사용된 핵심 기법:
+
+    · Weight Modulation / Demodulation (ModulatedConv2d)
+        w-space 잠재 벡터로 컨볼루션 가중치를 per-sample 변조한 뒤
+        demodulation(표준편차 정규화)으로 "blob" 아티팩트를 제거합니다.
+        기존 AdaIN을 교체하여 특징맵 통계 대신 가중치 자체를 직접 제어합니다.
+
+    · Equalized Learning Rate (EqualLinear, EqualConv2d)
+        모든 레이어의 가중치를 N(0,1)로 초기화하고, 순전파 시 He 초기화 스케일을
+        (1/sqrt(fan_in))으로 곱해 적용합니다. 이렇게 하면 파라미터 크기가
+        레이어마다 비슷하게 유지되어 Adam의 적응적 학습률이 모든 레이어에
+        균일하게 작동합니다.
+
+    · Non-Saturating Logistic Loss (D/G 모두)
+        D: softplus(-D(real)) + softplus(D(fake))
+        G: softplus(-D(fake))
+        기존 GAN 손실과 달리 D가 강해도 G 그래디언트가 소실되지 않습니다.
+
+    · R1 Gradient Penalty (Lazy Regularization)
+        실제 이미지에 대해서만 그래디언트 페널티를 적용하는 단측 GP.
+        gamma/2 * E[||grad_x D(x)||²] 형태이며, 16 D 스텝마다 1회(lazy) 실행합니다.
+        메모리와 연산 오버헤드를 낮추면서 모드 붕괴를 방지합니다.
+
+    · Path-Length Regularization (Lazy Regularization)
+        Jacobian J_w: w→image 의 Frobenius norm이 일정하도록 유도합니다.
+        (||J_w^T v|| − EMA)² 형태, 4 G 스텝마다 1회(lazy) 실행합니다.
+        w-space가 이방적(isotropic)으로 정렬되어 truncation trick의 효과를 높입니다.
+
+    · Mapping Network
+        z를 직접 synthesis에 주입하지 않고, 별도의 MLP로 w-space로 비선형
+        매핑합니다. 이 disentangled w-space가 스타일 편집 및 truncation을
+        가능하게 합니다.
+
+    · PixelNorm
+        Mapping network 입력 z를 픽셀 정규화(feature-wise L2 정규화)합니다.
+        z의 크기 차이가 첫 레이어를 과도하게 자극하는 것을 방지합니다.
+
+    · MinibatchStddev (Discriminator)
+        미니배치 내 분산 정보를 feature map에 추가하여 D가 다양성 결여를
+        감지할 수 있게 합니다. mode collapse 억제에 도움을 줍니다.
+
+
+[2] StyleGAN-Small — arXiv:2407.05527
+
+    파라미터 절감과 고해상도 디테일 개선을 위한 SqueezeConnection 구조 도입.
+    사용된 핵심 기법:
+
+    · SqueezeConnection (conv2 + ToRGB 대체)
+        기존 StyleGAN2의 합성 블록은 블록당 두 번의 ModulatedConv2d와
+        하나의 ToRGB를 사용합니다. 이 구조에서 ToRGB는 표준 conv2d 이후
+        3채널로 직접 투영하는 '1×1 병목'을 통과하며, 고해상도 디테일 정보가
+        손실됩니다.
+
+        SqueezeConnection은 이를 다음 5단계 경로로 교체합니다:
+          1. Squeeze  : EqualConv2d(c → c/8, k=3) — 채널을 1/8로 압축
+          2. Noise    : NoiseInjection — 제거된 conv2의 확률성(stochasticity) 복원
+          3. ToRGB    : ModulatedConv2d 1×1로 압축된 피처에서 RGB 생성
+             → 1×1 병목을 통과하는 채널 수가 c → c/8로 줄어 정보 손실 감소
+          4. Excite   : EqualConv2d(c/8 → c, k=3) — 채널을 다시 확장
+          5. Project  : EqualConv2d(2c → c, k=1) — cat(x, excite 출력)을 투영
+
+        결과적으로 블록당 ModulatedConv2d 1개 + SqueezeConnection으로 구성되며,
+        기존 대비 파라미터를 절감하면서 RGB 정보 병목을 완화합니다.
+        (최소 squeeze 채널은 8로 고정하여 극소 채널에서의 퇴화를 방지)
+
+
+[3] StyleGAN3 — Alias-Free Generative Adversarial Networks
+    Karras et al., 2021 (https://arxiv.org/abs/2106.12423)
+
+    직접적인 구조 차용은 없으나, 고해상도 GAN 학습의 안정성 및 정규화 기법,
+    alias-free 이론이 본 프로젝트의 모델 설계 방향에 참고되었습니다.
+
+
+[4] StyleGAN-XL — Scaling StyleGAN to Large Diverse Datasets
+    Sauer et al., 2022 (https://arxiv.org/abs/2202.00273)
+
+    대규모 다양한 데이터셋으로의 StyleGAN 확장 전략, channel schedule 설계,
+    고해상도에서의 배치 크기 및 학습률 조정 전략이 참고되었습니다.
+
+
+[5] StyleSwin — Transformer-based GAN for High-resolution Image Generation
+    Zhang et al., 2022 (https://arxiv.org/abs/2112.10762)
+
+    Swin Transformer 기반 GAN의 고해상도 생성 전략 및 블록 설계가
+    SqueezeConnection 방향성 결정 시 비교 참고되었습니다.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3. 모델 전체 구조
+────────────────────────────────────────────────────────────────────────────────
+
+3-1. Generator 전체 흐름
+─────────────────────────
+
+  z (N, 512)
+    │
+    ▼
+  MappingNetwork ──────────────────────────────── w (N, 640)
+    │ 12-layer EqualLinear MLP
+    │ PixelNorm 입력, lr_mul=0.01 (느린 학습으로 매핑 안정화)
+    │
+    ▼
+  w (N, 640) ──┬──────────────────────────────────────────┐
+               │ (모든 합성 블록에 동일한 w 주입)            │
+               ▼                                          │
+  SynthesisBlock4 (4×4)                                  │
+    │ const (1, 512, 4, 4) learnable parameter           │
+    │ ModulatedConv2d(512→512, k=3) + NoiseInjection     │
+    │ SqueezeConnection → rgb (N, 3, 4, 4)               │
+    │                                                     │
+    ▼                                                     │
+  SynthesisBlock (4×4 → 8×8)                             │
+    │ ModulatedConv2d(512→512, k=3, upsample=True)        │
+    │ NoiseInjection                                      │
+    │ SqueezeConnection → rgb_cur                         │
+    │ rgb = bilinear_upsample(prev_rgb) + rgb_cur         │
+    ▼
+  ... (8→16, 16→32, 32→64, 64→128, 128→256, 256→512, 512→1024)
+    │
+    ▼
+  tanh(rgb) → 출력 (N, 3, 1024, 1024), range [-1, 1]
+
+
+3-2. 채널 스케줄 (channel_base=131072, channel_max=512)
+────────────────────────────────────────────────────────
+
+  해상도  :   4    8   16   32   64  128  256  512 1024
+  채널 수 : 512  512  512  512  512  512  512  256  128
+
+  nf(resolution) = min(channel_max, channel_base // resolution)
+
+
+3-3. Discriminator 구조
+────────────────────────
+
+  입력: (N, 3, 1024, 1024)
+    │
+    ▼
+  FromRGB: EqualConv2d(3 → 128, k=1) + LeakyReLU
+    │
+    ▼
+  DiscBlock ×8 (1024→512→...→8→4):
+    │  잔차(residual) 구조
+    │  conv1: EqualConv2d(in_ch, in_ch, k=3) + LeakyReLU
+    │  avg_pool2d(2)
+    │  conv2: EqualConv2d(in_ch, out_ch, k=3) + LeakyReLU
+    │  skip:  EqualConv2d(in_ch, out_ch, k=1) + avg_pool2d(2)
+    │  출력 = (conv_path + skip_path) / sqrt(2)
+    ▼
+  MinibatchStddev (group_size=4)
+    │  배치 내 표준편차를 채널로 추가 → (N, 512+1, 4, 4)
+    ▼
+  EqualConv2d(513 → 512, k=3) + LeakyReLU
+    ▼
+  Flatten
+    ▼
+  EqualLinear(512×4×4 → 512) + LeakyReLU
+    ▼
+  EqualLinear(512 → 1)
+    │
+    ▼
+  스칼라 판별 점수 (N, 1)
+
+
+3-4. 파라미터 수
+─────────────────
+
+  Generator (PyTorch): ~34.10M
+  Generator (ONNX initializer): ~35.5M
+    └ 차이(~1.4M): do_constant_folding이 EqualLinear의
+      weight × scale 곱을 별도 initializer로 상수 접기하기 때문
+
+
+────────────────────────────────────────────────────────────────────────────────
+4. 데이터 처리
+────────────────────────────────────────────────────────────────────────────────
+
+4-1. 데이터셋
+──────────────
+
+  FFHQ (Flickr-Faces-HQ):
+    - train: 50,000장 (train_50k_{res}.zip)
+    - valid: 10,000장 (valid_10k_{res}.zip)
+
+  각 해상도(256/512/1024)별로 별도로 전처리된 zip이 제공됩니다.
+  1024 train 데이터는 ~20개 청크로 분할되어 Google Drive에 저장됩니다.
+
+
+4-2. 청크 병합 및 무결성 검증
+───────────────────────────────
+
+  대용량 zip 파일은 Drive 업로드 제약으로 분할 저장됩니다.
+  split_manifest.json에 각 zip의 총 크기와 청크별 크기가 기록되어 있으며,
+  병합 후 다음을 순서대로 검증합니다:
+
+    1. 각 청크 파일의 크기가 manifest와 일치하는지 확인 (복사 중 잘림 방지)
+    2. 병합된 zip의 총 크기가 manifest와 일치하는지 확인
+    3. zipfile.is_zipfile()로 zip 헤더 무결성 확인
+
+  이미 병합된 파일이 있으면 크기/zip 검증을 통과하면 재병합을 건너뜁니다.
+
+
+4-3. 압축 해제 (parallel_unzip)
+─────────────────────────────────
+
+  대용량 zip의 빠른 압축 해제를 위해 parallel_unzip 모듈을 사용합니다.
+
+    - 멀티프로세싱으로 파일을 병렬 추출
+    - strip_dirs=True: zip 내부 디렉토리 구조를 평탄화하여 이미지만 추출
+    - stage_local=True: 임시 경로에 먼저 추출 후 이동 (디스크 단편화 방지)
+
+
+4-4. FFHQDataset 및 DataLoader
+────────────────────────────────
+
+  FFHQDataset 클래스가 두 가지 디렉토리 레이아웃을 지원합니다:
+
+    (a) Flat 단일 디렉토리: 00000.jpg ~ 69999.jpg → split='train'/'valid' 인덱스 필터
+    (b) Pre-split 디렉토리: 별도 폴더에 이미 분리된 이미지 → split=None
+
+  본 프로젝트는 (b) 방식 사용: train_50k_{res}.zip → /content/ffhq_{res}/train/
+
+  전처리 파이프라인:
+    1. Resize(resolution, resolution)  — LANCZOS 보간 (aliasing 최소화)
+    2. RandomHorizontalFlip()          — train만 적용, valid/test 미적용
+    3. ToTensor()                      — [0, 255] uint8 → [0.0, 1.0] float32
+    4. Normalize([0.5, 0.5, 0.5],
+                 [0.5, 0.5, 0.5])     — [0, 1] → [-1, 1] (tanh 출력 범위와 일치)
+
+  DataLoader 설정:
+    - shuffle=True (train), False (valid)
+    - drop_last=True (train, 배치 크기 일정 유지)
+    - pin_memory=True (GPU 전송 가속)
+    - persistent_workers=True (worker 재시작 오버헤드 제거)
+    - num_workers=4
+
+
+────────────────────────────────────────────────────────────────────────────────
+5. 학습 방식
+────────────────────────────────────────────────────────────────────────────────
+
+5-1. 프로그레시브 트레이닝
+───────────────────────────
+
+  낮은 해상도에서 안정적으로 학습한 뒤 순차적으로 해상도를 높이는 전략입니다.
+
+    Stage 1: 256×256 — 처음부터(from scratch) 학습
+    Stage 2: 512×512 — 256 체크포인트에서 파인튜닝
+    Stage 3: 1024×1024 — 512 체크포인트에서 파인튜닝
+
+  해상도 전환 시 load_from_lower_resolution() 사용:
+    - Generator: 기존 블록은 이전 체크포인트 가중치 로드,
+                 새 고해상도 SynthesisBlock은 랜덤 초기화
+    - Discriminator: 새 from_rgb + blocks[0]은 랜덤 초기화,
+                     나머지 블록은 인덱스를 1씩 밀어서 이전 가중치 로드
+
+  이 방식으로 낮은 해상도에서 학습한 지식을 보존하면서,
+  새로 추가된 고해상도 블록만 점진적으로 학습시킵니다.
+
+
+5-2. GAN 학습 루프
+───────────────────
+
+  매 스텝:
+    1. D step: 실제 이미지 + 생성 이미지로 D 업데이트
+    2. G step: 생성 이미지로 G 업데이트
+
+  Lazy Regularization:
+    - R1 (D 정규화): 16 D 스텝마다 1회 실행
+    - PL (G 정규화):  4 G 스텝마다 1회 실행
+
+  이 방식은 매 스텝 정규화 대비 연산량을 크게 줄이면서도,
+  옵티마이저 LR·β₂를 interval/(interval+1) 비율로 보정하여
+  effective learning dynamics를 동일하게 유지합니다.
+
+
+5-3. Automatic Mixed Precision (AMP)
+──────────────────────────────────────
+
+  torch.amp.GradScaler와 autocast("cuda")를 사용하여 fp16으로 연산합니다.
+  단, 수치 안정성 문제가 발생하는 두 곳은 fp32 강제 실행합니다:
+
+    (a) ModulatedConv2d demodulation:
+        weight² 합산이 512채널 × 3×3 = 4608항으로, fp16 최대값(65504)을
+        초과할 수 있습니다(값 약 10일 때 10²×4608≈460k). overflow 시
+        rsqrt(inf)=0으로 모든 가중치가 0이 되는 silent failure를 방지하기 위해
+        해당 연산만 fp32로 캐스팅합니다.
+
+    (b) R1 double-backward:
+        fp16에서 grad.pow(2) 계산 시 overflow로 그래디언트가 inf가 되어
+        Discriminator가 붕괴될 수 있습니다. R1 전체를 autocast(enabled=False)
+        하에 실행합니다.
+
+    (c) Path-length regularization:
+        grad².sum()이 0에 가까울 때 sqrt 역전파가 inf(NaN)가 되는 것을
+        (grad².sum() + 1e-8).sqrt()로 방지합니다.
+
+
+5-4. 옵티마이저 설정
+─────────────────────
+
+  두 개의 독립 Adam 옵티마이저 (G와 D 별도):
+
+    β1 = 0.0     (momentum 없음 — GAN 학습의 표준 설정)
+    β2 = 0.99^(interval/(interval+1))  (lazy reg 보정값)
+    ε  = 1e-8
+
+  실제 lr = cfg.lr × interval/(interval+1) (lazy reg 보정)
+
+
+5-5. Gradient Clipping
+───────────────────────
+
+  G 업데이트(주 손실 + PL 정규화) 모두에 그래디언트 클리핑 적용:
+
+    nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
+
+  학습 초기 불안정한 합성 블록의 폭발적 그래디언트를 억제합니다.
+  D에는 R1 스텝에서만 적용합니다.
+
+
+5-6. Path-Length Warmup
+────────────────────────
+
+  해상도 전환 시 mean_path_length는 이전 체크포인트에서 전달되지 않습니다
+  (해상도가 다르면 절대적인 path length 값이 달라지기 때문).
+  처음 pl_warmup_steps 동안은 PL 정규화를 건너뛰어, EMA target이 0인 상태에서
+  pl_loss = pl_lengths²로 폭발하는 것을 방지합니다.
+
+    Stage 1: pl_warmup_steps = 1000
+    Stage 2: pl_warmup_steps = 500
+    Stage 3: pl_warmup_steps = 500
+
+
+5-7. 체크포인트 및 모니터링
+────────────────────────────
+
+  체크포인트 저장 항목:
+    - step, G state_dict, D state_dict
+    - g_optim, d_optim state_dict
+    - mean_path_length (PL EMA 상태)
+    - cfg (재현성을 위한 설정값)
+    - wandb_run_id (WandB 실행 재연결용)
+
+  복구 시 cfg의 lr을 재적용하여 yaml 변경이 resume 시에도 반영됩니다.
+  모든 체크포인트는 Google Drive로 자동 백업됩니다.
+
+  WandB 로깅:
+    - D/loss, D/real_score, D/fake_score, D/score_gap (모드 붕괴 탐지)
+    - D/r1_penalty
+    - G/loss, G/pl_penalty, G/pl_lengths_mean
+    - G/img_mean, G/img_std (std → 0은 G 붕괴 신호)
+    - FID (valid set 10k, fid_interval마다)
+    - samples (16장 이미지 그리드, sample_interval마다, noise_mode="const")
+
+
+────────────────────────────────────────────────────────────────────────────────
+6. 주요 하이퍼파라미터
+────────────────────────────────────────────────────────────────────────────────
+
+6-1. 모델 구조 하이퍼파라미터
+───────────────────────────────
+
+  파라미터           값        설명
+  ─────────────────────────────────────────────────────────────────────────────
+  z_dim              512       입력 잠재 노이즈 차원
+  w_dim              640       Mapping Network 출력 w-space 차원
+                               (StyleGAN2 원 구현의 512보다 크게 설정하여
+                                mapping capacity 증가)
+  mapping_layers     12        Mapping Network MLP 레이어 수
+                               (원 구현의 8보다 많아 더 강한 disentanglement)
+  mapping_lr_mul     0.01      Mapping Network LR 배율
+                               (매우 낮게 설정하여 w-space 갑작스러운 변화 억제)
+  channel_base       131072    채널 스케줄 기반값: nf(r) = min(ch_max, base/r)
+  channel_max        512       채널 수 상한
+  squeeze_ratio      8         SqueezeConnection 압축 비율 (c → c/8)
+
+
+6-2. 스테이지별 학습 하이퍼파라미터
+─────────────────────────────────────
+
+  파라미터           Stage 1 (256)   Stage 2 (512)   Stage 3 (1024)
+  ─────────────────────────────────────────────────────────────────────────────
+  batch_size         16              8               4
+  lr_g               0.001           0.001           0.001
+  lr_d               0.001           0.001           0.0005
+  r1_gamma           10.0            15.0            30.0
+                     └ 해상도가 높을수록 D 과도 학습이 심해지므로 gamma 증가
+  pl_weight          2.0             2.0             2.0
+  pl_decay           0.01            0.01            0.01
+  pl_warmup_steps    1000            500             500
+  grad_clip          1.0             1.0             1.0
+  total_kimg         25000           10000           10000
+  d_reg_interval     16              16              16
+  g_reg_interval     4               4               4
+  use_amp            true            true            true
+  num_workers        4               4               4
+
+
+6-3. 평가 및 저장 간격
+────────────────────────
+
+  설정               Stage 1 (256)   Stage 2 (512)   Stage 3 (1024)
+  ─────────────────────────────────────────────────────────────────────────────
+  log_interval       500             100             100
+  sample_interval    1000            500             500
+  fid_interval       5000            2000            2000
+  save_interval      5000            2000            2000
+  n_fid_samples      10000           10000           10000
+
+
+6-4. lr_g = 0.001 선택 이유
+─────────────────────────────
+
+  β1=0 Adam과 ToRGB 블록 다수 구조에서, lr=0.002는 학습 초기 300스텝 내에
+  pre-tanh 편향 누적이 약 4.2에 달하여 tanh 포화(all-white collapse)를 유발했습니다.
+  lr=0.001로 절반으로 낮추면 누적이 약 2.1로 감소하여 포화 이전 학습이 시작됩니다.
+
+
+────────────────────────────────────────────────────────────────────────────────
+7. FID 평가
+────────────────────────────────────────────────────────────────────────────────
+
+7-1. 평가 방식
+───────────────
+
+  FID(Fréchet Inception Distance)는 실제 이미지와 생성 이미지의 분포 차이를
+  InceptionV3의 2048차원 피처 공간에서 측정합니다.
+  FID 값이 낮을수록 생성 이미지의 품질과 다양성이 높습니다.
+
+  · 실제 통계 (μ_real, Σ_real): 검증셋 10,000장에서 계산, 세션당 1회 캐시
+  · 생성 통계 (μ_fake, Σ_fake): G로 10,000장 생성 후 계산
+  · 계산: FID = ||μ_r - μ_f||² + Tr(Σ_r + Σ_f - 2(Σ_r Σ_f)^(1/2))
+
+  이미지는 InceptionV3 입력 크기 299×299로 bilinear 리사이즈 후
+  [-1,1] → [0,1]로 스케일링하여 피처를 추출합니다.
+
+
+7-2. ValidFIDCache
+────────────────────
+
+  ValidFIDCache 클래스가 실제 통계를 1회 계산 후 세션 동안 캐시합니다.
+  반복 FID 계산 시 실제 이미지 피처 추출을 중복하지 않아 효율적입니다.
+
+    cache = ValidFIDCache(valid_loader, device)
+    fid = cache.compute(G, n_gen=10000, batch_size=16)
+
+
+────────────────────────────────────────────────────────────────────────────────
+8. ONNX 변환 및 제출
+────────────────────────────────────────────────────────────────────────────────
+
+8-1. 변환 전략
+───────────────
+
+  ONNX 변환에서 두 가지 주요 문제를 해결했습니다:
+
+  (a) 동적 배치 차원 문제 (ModulatedConv2d)
+      기존 ModulatedConv2d forward는 groups=batch_size로 conv2d를 실행합니다.
+      이 방식은 배치 차원이 고정된 경우에만 ONNX로 내보낼 수 있으며,
+      동적 배치(batch dimension dynamic)를 지원하지 않습니다.
+
+      → export_onnx.py의 _onnx_modconv_forward:
+        groups=b 대신 커널 위치(k×k = 9회)를 순환하는 BMM 루프로 교체합니다.
+        각 위치 (di, dj)에서:
+          w_pos = weight[:, :, :, di, dj]        # (b, out_ch, c)
+          x_sl  = x_padded[:, :, di:di+h, dj:dj+wd]
+          part  = torch.bmm(w_pos, x_sl.reshape(b, c, h*w))
+        9개의 bmm 결과를 합산하면 deformed conv와 동일한 결과를 얻습니다.
+        배치 차원이 -1(symbolic)로 처리되어 동적 배치를 지원합니다.
+
+  (b) 노이즈 고정
+      학습 시 NoiseInjection은 매 순전파마다 다른 난수 노이즈를 주입합니다.
+      ONNX 그래프는 확정적(deterministic)이어야 하므로, 내보내기 시
+      noise_mode="none"으로 모든 노이즈를 0으로 고정합니다.
+      do_constant_folding=True로 이 0 텐서들이 그래프에서 상수 접혀
+      파라미터 수에 영향을 주지 않습니다.
+
+
+8-2. 변환 절차
+───────────────
+
+  ① G.eval() 및 CPU 이동
+     (CUDA에서 constant folding은 GPU 텐서와 CPU 중간 결과 혼재로 오류 발생)
+
+  ② _NoNoiseWrapper 또는 SubmissionWrapper로 감싸기
+     z → G(z, noise_mode="none") → image 흐름만 추적
+
+  ③ torch.onnx.export 호출:
+       opset_version = 17
+       dynamo = False  (dynamo 경로는 groups=B를 opset 17에서 표현 불가)
+       do_constant_folding = True
+       input_names = ["z"]
+       output_names = ["image"]
+       dynamic_axes: 배치 차원을 dynamic으로 지정
+
+  ④ ONNX 검증:
+       onnx.checker.check_model() — 그래프 구조 유효성
+       onnxruntime InferenceSession — 실제 추론 실행 및 출력 범위 확인
+
+
+8-3. ONNX 파라미터 수 검증
+────────────────────────────
+
+  제출 규격: ONNX initializer 수 < 50,000,000
+
+  검증 방법:
+    model_onnx = onnx.load(path)
+    n_params = sum(int(np.prod(t.dims)) for t in model_onnx.graph.initializer)
+
+  결과:
+    PyTorch named_parameters() : ~34,100,000 (~34.10M)
+    ONNX graph.initializer 수  : ~35,500,000 (~35.50M)
+    제출 한도                  :  50,000,000  (50M)
+    여유                       : ~14.5M
+
+  ONNX가 PyTorch보다 ~1.4M 많은 이유:
+    do_constant_folding=True가 EqualLinear의 weight × scale 곱을
+    별도의 initializer 노드로 상수 접기(constant folding)하기 때문입니다.
+    실제 모델 표현 능력은 동일합니다.
+
+
+8-4. 검증 (verify_onnx.py)
+────────────────────────────
+
+  onnxruntime을 사용하여 다음을 확인합니다:
+
+    for b in (1, 2):
+        z = np.random.randn(b, 512).astype(np.float32)
+        img = session.run(None, {"z": z})[0]
+        assert img.shape == (b, 3, 1024, 1024)
+        assert -1.0 <= img.min() and img.max() <= 1.0
+
+
+────────────────────────────────────────────────────────────────────────────────
+9. 결론
+────────────────────────────────────────────────────────────────────────────────
+
+9-1. 아키텍처 선택의 결과
+──────────────────────────
+
+  StyleGAN2에 SqueezeConnection(StyleGAN-Small)을 적용하여:
+
+  · 파라미터 절감:
+    기존 conv2+ToRGB 구조 대비 블록당 파라미터가 감소하였습니다.
+    최종 1024 Generator는 34.10M 파라미터로 50M 한도에 여유 있게 수렴합니다.
+
+  · ToRGB 병목 완화:
+    기존 구조에서는 c채널 피처를 3채널로 직접 투영하는 병목이 존재합니다.
+    SqueezeConnection은 c/8 채널의 squeezed 피처에서 ToRGB를 수행하므로
+    투영 시 정보 손실이 줄어들고, squeeze/excite 경로를 통해 공간적 문맥을
+    풍부하게 활용합니다.
+
+  · 수치 안정성:
+    AMP 환경에서 발생 가능한 overflow/NaN 문제들을 모두 fp32 fallback으로
+    해결하였으며, 학습 내내 안정적인 그래디언트 흐름을 유지했습니다.
+
+
+9-2. 프로그레시브 트레이닝의 효과
+──────────────────────────────────
+
+  256 → 512 → 1024 순서의 단계적 학습은 다음 이점을 제공합니다:
+
+  · 저해상도에서 글로벌 구조(얼굴 형태, 배치)를 먼저 학습하고,
+    고해상도 단계에서 세부 텍스처를 추가합니다.
+
+  · 고해상도 단계에서 배치 크기를 줄여(16→8→4) GPU 메모리를 관리하면서도,
+    낮은 해상도에서 충분히 학습된 가중치 덕분에 수렴이 빠릅니다.
+
+  · load_from_lower_resolution()의 선택적 가중치 로드로, 기존 지식을 보존하면서
+    새 고해상도 블록만 추가 학습하는 효율적인 전이 학습이 가능합니다.
+
+
+9-3. ONNX 변환의 핵심 해결책
+──────────────────────────────
+
+  표준 StyleGAN2의 groups=batch_size conv2d는 ONNX 동적 배치를 지원하지 않는
+  구조적 한계가 있습니다. 이를 커널 위치별 BMM 루프로 교체하여 수학적으로 동일한
+  결과를 내면서 ONNX opset 17과 완전히 호환되는 그래프를 생성했습니다.
+
+
+9-4. 최종 제출 사양
+────────────────────
+
+  파일: generator_1024.onnx (또는 generator_1024_step20000.onnx)
+
+  입력  z     : shape (N, 512), dtype float32
+  출력  image : shape (N, 3, 1024, 1024), dtype float32, range [-1, 1]
+  ONNX 파라미터: ~35.5M (한도 50M, 여유 ~14.5M)
+  ONNX opset  : 17
+  배치 차원   : 동적(dynamic) 지원
+
+
+================================================================================
+  끝
+================================================================================

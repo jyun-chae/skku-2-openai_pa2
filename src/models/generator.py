@@ -283,12 +283,26 @@ class StyleGAN2Generator(nn.Module):
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def load_from_lower_resolution(self, state_dict: dict) -> None:
-        """Load weights from a lower-resolution checkpoint; new higher-res blocks stay random-init."""
+    def load_from_lower_resolution(self, state_dict: dict, freeze_existing: bool = False) -> None:
+        """Load weights from a lower-resolution checkpoint; new higher-res blocks stay random-init.
+
+        Args:
+            state_dict:      G state dict from the previous-stage checkpoint.
+            freeze_existing: If True, freeze all loaded params (requires_grad=False).
+                             Call trainer.rebuild_optimizers() afterwards so frozen
+                             params are excluded from the optimizer.
+        """
         own = self.state_dict()
         filtered = {k: v for k, v in state_dict.items() if k in own and own[k].shape == v.shape}
         own.update(filtered)
         self.load_state_dict(own)
-        loaded = len(filtered)
-        total = len(own)
-        print(f"Loaded {loaded}/{total} tensors from lower-resolution checkpoint.")
+        print(f"Loaded {len(filtered)}/{len(own)} tensors from lower-resolution checkpoint.")
+
+        if freeze_existing and filtered:
+            frozen = 0
+            for name, param in self.named_parameters():
+                if name in filtered:
+                    param.requires_grad_(False)
+                    frozen += 1
+            trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            print(f"  Froze {frozen} param tensors. G trainable: {trainable:,}")
