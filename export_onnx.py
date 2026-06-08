@@ -231,7 +231,6 @@ def export_to_onnx(
         input_names=["z"],
         output_names=["image"],
         opset_version=opset,
-        dynamic_axes={"z": {0: "batch"}, "image": {0: "batch"}},
         dynamo=False,
     )
 
