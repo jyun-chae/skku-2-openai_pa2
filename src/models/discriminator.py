@@ -11,10 +11,6 @@ import torch.nn.functional as F
 from .layers import EqualConv2d, EqualLinear
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _nf(resolution: int, channel_base: int = 131072, channel_max: int = 512) -> int:
     return min(channel_max, int(channel_base / resolution))
 
@@ -24,6 +20,11 @@ def _nf(resolution: int, channel_base: int = 131072, channel_max: int = 512) -> 
 # ---------------------------------------------------------------------------
 
 class MinibatchStddev(nn.Module):
+    """Appends per-group feature std as an extra channel to help D detect mode collapse.
+
+    Computing std within groups (not the full batch) prevents D from memorising
+    batch-level statistics at small batch sizes.
+    """
 
     def __init__(self, group_size: int = 4, num_features: int = 1) -> None:
         super().__init__()
@@ -45,13 +46,14 @@ class MinibatchStddev(nn.Module):
 
 
 class DiscBlock(nn.Module):
+    """Residual downscale block: conv×2 with avg-pool skip connection."""
 
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
         self.conv1 = EqualConv2d(in_ch, in_ch, kernel=3, padding=1)
         self.conv2 = EqualConv2d(in_ch, out_ch, kernel=3, padding=1)
-        self.skip = EqualConv2d(in_ch, out_ch, kernel=1, bias=False)
-        self.act = nn.LeakyReLU(0.2)
+        self.skip  = EqualConv2d(in_ch, out_ch, kernel=1, bias=False)
+        self.act   = nn.LeakyReLU(0.2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.skip(F.avg_pool2d(x, 2))
@@ -60,15 +62,17 @@ class DiscBlock(nn.Module):
         out = F.avg_pool2d(out, 2)
         out = self.act(self.conv2(out)) * math.sqrt(2)
 
+        # /sqrt(2): normalises variance through the residual addition
         return (out + residual) / math.sqrt(2)
 
 
 class FromRGB(nn.Module):
+    """Projects 3-channel RGB input into the discriminator feature space."""
 
     def __init__(self, out_ch: int) -> None:
         super().__init__()
         self.conv = EqualConv2d(3, out_ch, kernel=1)
-        self.act = nn.LeakyReLU(0.2)
+        self.act  = nn.LeakyReLU(0.2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.conv(x)) * math.sqrt(2)
@@ -79,19 +83,19 @@ class FromRGB(nn.Module):
 # ---------------------------------------------------------------------------
 
 class StyleGAN2Discriminator(nn.Module):
-    """StyleGAN2 Discriminator for a given resolution.
+    """StyleGAN2 discriminator for a given resolution.
 
     Args:
-        resolution:    Input image resolution (256, 512, or 1024).
-        channel_base:  Channel schedule base (mirrors generator default).
-        channel_max:   Maximum channels per layer.
-        mbstd_group:   Minibatch stddev group size.
+        resolution:   Input image resolution (256, 512, or 1024).
+        channel_base: Channel schedule base (must match the generator).
+        channel_max:  Maximum channels per layer.
+        mbstd_group:  Minibatch stddev group size.
     """
 
     def __init__(
         self,
         resolution: int = 256,
-        channel_base: int = 131072,  # must match generator's channel_base
+        channel_base: int = 131072,
         channel_max: int = 512,
         mbstd_group: int = 4,
     ) -> None:
@@ -114,11 +118,11 @@ class StyleGAN2Discriminator(nn.Module):
             in_ch = out_ch
         self.blocks = nn.ModuleList(blocks)
 
-        self.mbstd = MinibatchStddev(mbstd_group)
+        self.mbstd  = MinibatchStddev(mbstd_group)
         self.conv_4 = EqualConv2d(in_ch + 1, in_ch, kernel=3, padding=1)
-        self.act = nn.LeakyReLU(0.2)
-        self.fc = EqualLinear(in_ch * 4 * 4, in_ch)
-        self.out = EqualLinear(in_ch, 1)
+        self.act    = nn.LeakyReLU(0.2)
+        self.fc     = EqualLinear(in_ch * 4 * 4, in_ch)
+        self.out    = EqualLinear(in_ch, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.from_rgb(x)
@@ -131,21 +135,18 @@ class StyleGAN2Discriminator(nn.Module):
         feat = self.act(self.fc(feat)) * math.sqrt(2)
         return self.out(feat)
 
-    def load_from_lower_resolution(self, state_dict: dict, freeze_existing: bool = False) -> None:
-        """Load D weights from a lower-resolution checkpoint; new from_rgb and blocks[0] stay random-init.
+    def load_from_lower_resolution(self, state_dict: dict) -> None:
+        """Load D weights from a lower-res checkpoint.
 
-        Args:
-            state_dict:      D state dict from the previous-stage checkpoint.
-            freeze_existing: If True, freeze all loaded params (requires_grad=False).
-                             Call trainer.rebuild_optimizers() afterwards so frozen
-                             params are excluded from the optimizer.
+        from_rgb and blocks[0] must match the new (larger) resolution, so they
+        stay random-init. All other blocks shift up by one index to make room.
         """
         own = self.state_dict()
         new_state: dict = {}
 
         for k, v in state_dict.items():
             if k.startswith('from_rgb.') or k.startswith('blocks.0.'):
-                continue
+                continue  # these match the new resolution — keep random init
             elif k.startswith('blocks.'):
                 parts = k.split('.')
                 new_key = f'blocks.{int(parts[1]) + 1}.' + '.'.join(parts[2:])
@@ -159,12 +160,3 @@ class StyleGAN2Discriminator(nn.Module):
         self.load_state_dict(own)
         print(f'D loaded {len(new_state)}/{len(own)} tensors '
               f'(new from_rgb + blocks.0 are random-init).')
-
-        if freeze_existing and new_state:
-            frozen = 0
-            for name, param in self.named_parameters():
-                if name in new_state:
-                    param.requires_grad_(False)
-                    frozen += 1
-            trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            print(f"  Froze {frozen} param tensors. D trainable: {trainable:,}")

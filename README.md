@@ -2,7 +2,7 @@
 
 StyleGAN2 기반 무조건부 얼굴 생성기. FFHQ 데이터셋으로 256 → 512 → 1024 해상도 순서의 **프로그레시브 트레이닝**으로 학습합니다.
 
-- **Generator**: ~34.10M PyTorch 파라미터, ~35.5M ONNX initializer (50M 제출 한도 내)
+- **Generator**: ~34.10M PyTorch 파라미터, ~35.5M ONNX initializer (40M 제출 한도 내)
 - **입력**: `z ~ N(0, I)`, shape `(N, 512)`, dtype `float32`
 - **출력**: `(N, 3, 1024, 1024)`, dtype `float32`, range `[-1, 1]`
 
@@ -123,7 +123,6 @@ project02/
 ├── main.ipynb                 # Colab 학습 노트북 (전체 파이프라인)
 ├── submit_test.ipynb          # ONNX 파라미터 수 검증 노트북
 ├── export_onnx.py             # 학습된 체크포인트 → ONNX 변환 스크립트
-├── verify_onnx.py             # onnxruntime으로 ONNX 입출력 검증
 └── pyproject.toml
 ```
 
@@ -256,14 +255,6 @@ python export_onnx.py
 > **참고**: `export_onnx.py`는 기존 레거시 체크포인트(표준 StyleGAN2, `channel_base=65536`)용입니다.
 > SqueezeConnection 아키텍처로 학습한 체크포인트는 `G.export_onnx()` 또는 `submit_test.ipynb`를 사용합니다.
 
-### 검증
-
-```bash
-python verify_onnx.py
-```
-
-onnxruntime으로 배치 크기 1, 2에서 출력 shape `(B, 3, 1024, 1024)` 및 범위 `[-1, 1]`을 확인합니다.
-
 ### 제출 사양
 
 | 항목 | 값 |
@@ -274,7 +265,7 @@ onnxruntime으로 배치 크기 1, 2에서 출력 shape `(B, 3, 1024, 1024)` 및
 | 출력 범위 | `[-1, 1]` |
 | PyTorch 파라미터 | ~34.10M |
 | ONNX initializer 수 | ~35.5M |
-| ONNX 파라미터 한도 | 50M |
+| ONNX 파라미터 한도 | 40M |
 
 > ONNX count가 PyTorch count보다 ~1.4M 많은 이유:
 > `do_constant_folding=True`가 EqualLinear의 `weight × scale` 곱을 별도 initializer로 상수 접기하기 때문입니다.
@@ -292,7 +283,6 @@ torchvision >= 0.17.0
 wandb >= 0.17.0
 pytorch-fid >= 0.3.0
 onnx >= 1.16.0
-onnxruntime >= 1.18.0   # verify_onnx.py 실행 시
 pyyaml >= 6.0
 pillow >= 10.0.0
 numpy >= 1.24.0

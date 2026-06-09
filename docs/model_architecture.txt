@@ -1,0 +1,305 @@
+현재 모델 구조 정리
+====================
+
+이 프로젝트의 현재 모델은 StyleGAN2를 기반으로 한 얼굴 생성 GAN이다.
+생성기는 일반 StyleGAN2 synthesis block에서 두 번째 convolution과 ToRGB 경로를
+SqueezeConnection으로 대체한 구조이고, 판별기는 residual downsampling block을 쓰는
+StyleGAN2 계열 판별기이다.
+
+
+1. 전체 구성
+------------
+
+모델은 크게 두 부분으로 구성된다.
+
+1) Generator: StyleGAN2Generator
+   - 입력: z ~ N(0, I), shape = [B, 512]
+   - 출력: image, shape = [B, 3, resolution, resolution]
+   - 최종 출력 범위: tanh를 통과하므로 [-1, 1]
+   - 지원 해상도: 256, 512, 1024
+   - 최종 제출/전체 구조 기준 해상도: 1024 x 1024
+
+2) Discriminator: StyleGAN2Discriminator
+   - 입력: 실제 이미지 또는 생성 이미지, shape = [B, 3, resolution, resolution]
+   - 출력: real/fake 판별 logit, shape = [B, 1]
+   - residual block, minibatch stddev, EqualLinear head를 사용한다.
+
+
+2. Generator 상세 구조
+----------------------
+
+Generator는 Mapping Network와 Synthesis Network로 나뉜다.
+
+2.1 Mapping Network
+
+입력 latent z를 intermediate latent w로 변환한다.
+
+구성:
+  z [B, 512]
+    -> PixelNorm
+    -> EqualLinear + fused LeakyReLU x 12
+    -> w [B, 640]
+
+주요 설정:
+  z_dim = 512
+  w_dim = 640
+  mapping_layers = 12
+  mapping_lr_mul = 0.01
+
+생성기 내부에서는 하나의 w를 모든 synthesis block에 broadcast해서 사용한다.
+즉, 현재 구현은 style mixing을 직접 수행하지 않고 같은 w를 각 block의 style 입력으로 쓴다.
+
+
+2.2 Synthesis Network
+
+Synthesis Network는 4 x 4 learned constant에서 시작해서 목표 해상도까지 점진적으로
+upsampling한다. 각 해상도 block은 feature map과 RGB skip image를 함께 갱신한다.
+
+1024 기준 흐름:
+
+  learned constant [B, 512, 4, 4]
+    -> 4 x 4 SynthesisBlock4
+    -> 8 x 8 SynthesisBlock
+    -> 16 x 16 SynthesisBlock
+    -> 32 x 32 SynthesisBlock
+    -> 64 x 64 SynthesisBlock
+    -> 128 x 128 SynthesisBlock
+    -> 256 x 256 SynthesisBlock
+    -> 512 x 512 SynthesisBlock
+    -> 1024 x 1024 SynthesisBlock
+    -> tanh
+    -> image [B, 3, 1024, 1024]
+
+해상도별 채널 수는 다음과 같다.
+
+  resolution:   4    8    16   32   64   128  256  512  1024
+  channels:     512  512  512  512  512  512  512  256  128
+
+채널 수는 다음 식으로 계산된다.
+
+  channels = min(channel_max, channel_base / resolution)
+
+현재 설정:
+  channel_base = 131072
+  channel_max = 512
+
+
+2.3 4 x 4 Block
+
+첫 block은 learned constant를 입력으로 사용한다.
+
+구성:
+  learned constant
+    -> ModulatedConv2d 3 x 3
+    -> NoiseInjection
+    -> LeakyReLU
+    -> SqueezeConnection
+    -> feature x, rgb
+
+출력:
+  x: 다음 block으로 전달되는 feature map
+  rgb: 현재 해상도의 RGB image
+
+
+2.4 Upsampling Block
+
+8 x 8 이상 block은 이전 feature map과 이전 RGB image를 입력으로 받는다.
+
+구성:
+  x
+    -> ModulatedConv2d 3 x 3 with upsample
+    -> NoiseInjection
+    -> LeakyReLU
+    -> SqueezeConnection
+    -> x_out, rgb_cur
+
+  prev_rgb
+    -> bilinear upsample
+    -> prev_rgb_up
+
+  final rgb = prev_rgb_up + rgb_cur
+
+즉, 각 block은 feature map을 다음 해상도로 키우고, 동시에 현재 해상도에서의 RGB 출력을
+만든 뒤 이전 RGB skip image에 더한다. 이 skip RGB 누적 방식은 StyleGAN 계열의
+progressive ToRGB skip 구조와 같은 역할을 한다.
+
+
+3. SqueezeConnection 구조
+-------------------------
+
+현재 생성기의 핵심 차이는 SqueezeConnection이다.
+기존 StyleGAN2 block에서 흔히 쓰는 "conv2 + ToRGB" 경로를 아래 구조로 대체한다.
+
+입력:
+  x [B, C, H, W]
+  w [B, 640]
+
+구성:
+  x
+    -> squeeze: EqualConv2d 3 x 3, C -> max(C / 8, 8)
+    -> NoiseInjection
+    -> to_rgb: ModulatedConv2d 1 x 1, squeezed channels -> 3
+    -> rgb_cur
+
+  squeezed feature
+    -> excite: EqualConv2d 3 x 3, squeezed channels -> C
+    -> excited feature
+
+  concat(x, excited feature)
+    -> project: EqualConv2d 1 x 1, 2C -> C
+    -> x_out
+
+출력:
+  x_out: 다음 synthesis block으로 전달되는 feature
+  rgb_cur: 현재 해상도에서 생성된 RGB image
+
+현재 squeeze_ratio는 8이다. 따라서 대부분의 block에서 squeezed channel은 C / 8이고,
+너무 작아지는 것을 막기 위해 최소 8 channel을 사용한다.
+
+이 구조의 의도는 ToRGB 경로의 정보 병목을 완화하면서도 파라미터 수를 줄이는 것이다.
+또한 제거된 두 번째 convolution의 stochasticity를 보완하기 위해 squeezed feature에
+NoiseInjection을 적용한다.
+
+
+4. Discriminator 상세 구조
+--------------------------
+
+Discriminator는 입력 이미지를 낮은 해상도로 점진적으로 downsampling한 뒤 logit을 출력한다.
+
+1024 기준 흐름:
+
+  image [B, 3, 1024, 1024]
+    -> FromRGB: EqualConv2d 1 x 1 + LeakyReLU
+    -> DiscBlock 1024 -> 512
+    -> DiscBlock 512 -> 256
+    -> DiscBlock 256 -> 128
+    -> DiscBlock 128 -> 64
+    -> DiscBlock 64 -> 32
+    -> DiscBlock 32 -> 16
+    -> DiscBlock 16 -> 8
+    -> DiscBlock 8 -> 4
+    -> MinibatchStddev
+    -> EqualConv2d 3 x 3
+    -> Flatten
+    -> EqualLinear
+    -> EqualLinear
+    -> logit [B, 1]
+
+FromRGB의 출력 채널은 입력 해상도에 따라 정해진다.
+1024 입력에서는 channel schedule에 의해 128 channel에서 시작한다.
+
+
+4.1 DiscBlock
+
+각 DiscBlock은 residual 구조이다.
+
+main path:
+  x
+    -> EqualConv2d 3 x 3
+    -> LeakyReLU
+    -> avg_pool2d downsample
+    -> EqualConv2d 3 x 3
+    -> LeakyReLU
+
+skip path:
+  x
+    -> avg_pool2d downsample
+    -> EqualConv2d 1 x 1
+
+block output:
+  (main path + skip path) / sqrt(2)
+
+
+4.2 MinibatchStddev
+
+4 x 4 feature map에 도달한 뒤 minibatch standard deviation feature를 1 channel 추가한다.
+현재 기본 설정은 다음과 같다.
+
+  group_size = 4
+  num_features = 1
+
+그 뒤 EqualConv2d 3 x 3, flatten, EqualLinear 2개를 거쳐 최종 logit을 출력한다.
+
+
+5. 해상도별 학습 단계
+---------------------
+
+같은 모델 클래스를 사용하되 설정 파일에 따라 목표 해상도만 다르게 둔다.
+
+Stage 1:
+  config = configs/train_256.yaml
+  resolution = 256
+  batch_size = 16
+  lr_g = 0.001
+  lr_d = 0.001
+  r1_gamma = 10.0
+
+Stage 2:
+  config = configs/train_512.yaml
+  resolution = 512
+  batch_size = 8
+  lr_g = 0.001
+  lr_d = 0.001
+  r1_gamma = 15.0
+
+Stage 3:
+  config = configs/train_1024.yaml
+  resolution = 1024
+  batch_size = 4
+  lr_g = 0.001
+  lr_d = 0.0005
+  r1_gamma = 30.0
+
+256에서 학습한 checkpoint를 512 모델에 일부 로드하고, 512 checkpoint를 1024 모델에
+일부 로드하는 progressive training 방식이다. 새롭게 추가되는 고해상도 block은 랜덤
+초기화되고, shape이 맞는 기존 weight만 로드된다.
+
+
+6. 학습 손실과 정규화
+---------------------
+
+Discriminator:
+  - logistic loss
+  - lazy R1 regularization
+  - R1 interval = 16
+
+Generator:
+  - non-saturating logistic loss
+  - lazy path-length regularization
+  - path-length interval = 4
+
+공통:
+  - Adam optimizer
+  - lazy regularization 비율에 맞춘 learning rate correction
+  - AMP 사용
+  - grad_clip = 1.0
+
+수치 안정성을 위해 다음 처리가 들어가 있다.
+
+  - ModulatedConv2d demodulation은 fp32에서 계산한다.
+  - R1 regularization은 autocast를 끄고 fp32에서 계산한다.
+  - path-length loss에는 sqrt(0) 문제를 피하기 위한 작은 epsilon이 들어간다.
+
+
+7. 코드 위치
+------------
+
+Generator:
+  src/models/generator.py
+
+SqueezeConnection, ModulatedConv2d, EqualLinear, EqualConv2d:
+  src/models/layers.py
+
+Discriminator:
+  src/models/discriminator.py
+
+Training loop:
+  src/training/trainer.py
+
+Config:
+  configs/train_256.yaml
+  configs/train_512.yaml
+  configs/train_1024.yaml
+
+Architecture figure:
+  docs/model_architecture.svg

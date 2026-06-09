@@ -69,10 +69,8 @@ class Trainer:
 
     def _setup_optimizers(self) -> None:
         cfg = self.cfg
-        # Lazy regularization LR correction (StyleGAN2 §B).
-        # With lazy reg, effective steps per kimg = interval/(interval+1) of a
-        # non-lazy run. Scaling LR and beta2 by the same ratio keeps the
-        # effective learning dynamics identical to non-lazy training.
+        # Lazy-reg LR correction (StyleGAN2 §B): scale LR and β₂ by interval/(interval+1)
+        # so effective learning dynamics match per-step regularisation.
         g_ratio = cfg.g_reg_interval / (cfg.g_reg_interval + 1)
         d_ratio = cfg.d_reg_interval / (cfg.d_reg_interval + 1)
 
@@ -93,35 +91,8 @@ class Trainer:
         self.g_scaler = GradScaler("cuda", enabled=self.cfg.use_amp)
         self.d_scaler = GradScaler("cuda", enabled=self.cfg.use_amp)
 
-    def rebuild_optimizers(self) -> None:
-        """Rebuild G/D optimizers from currently trainable (requires_grad=True) params.
-
-        Call after load_from_lower_resolution(freeze_existing=True) so that
-        frozen params are excluded from the optimizer state entirely.
-        """
-        cfg = self.cfg
-        g_ratio = cfg.g_reg_interval / (cfg.g_reg_interval + 1)
-        d_ratio = cfg.d_reg_interval / (cfg.d_reg_interval + 1)
-
-        g_params = [p for p in self.G.parameters() if p.requires_grad]
-        d_params = [p for p in self.D.parameters() if p.requires_grad]
-
-        self.g_optim = torch.optim.Adam(
-            g_params, lr=cfg.lr_g * g_ratio,
-            betas=(0.0, 0.99 ** g_ratio), eps=1e-8,
-        )
-        self.d_optim = torch.optim.Adam(
-            d_params, lr=cfg.lr_d * d_ratio,
-            betas=(0.0, 0.99 ** d_ratio), eps=1e-8,
-        )
-        self._setup_scalers()
-
-        g_trainable = sum(p.numel() for p in g_params)
-        d_trainable = sum(p.numel() for p in d_params)
-        print(f"[Trainer] Rebuilt optimizers — G trainable: {g_trainable:,}  D trainable: {d_trainable:,}")
-
     # ------------------------------------------------------------------
-    # Training step
+    # Training steps
     # ------------------------------------------------------------------
 
     def _sample_z(self, batch: int) -> torch.Tensor:
@@ -157,8 +128,8 @@ class Trainer:
             "D/fake_score_sig": torch.sigmoid(fake_pred).mean().item(),
         }
 
-        # R1 must run in fp32: fp16 grad.pow(2) overflows (4608 terms → inf), rsqrt(inf)=0 kills D.
         if self.step % cfg.d_reg_interval == 0:
+            # R1 must run in fp32: fp16 grad.pow(2) overflows (512ch × 9 terms → ~460k > fp16 max), rsqrt(inf)=0 kills D.
             real_img_r1 = real_img.detach().float().requires_grad_(True)
             with autocast("cuda", enabled=False):
                 real_pred_r1 = self.D(real_img_r1)
@@ -192,20 +163,19 @@ class Trainer:
         self.g_scaler.step(self.g_optim)
         self.g_scaler.update()
 
-        # Log generated image statistics — a std → 0 means G is collapsing
         with torch.no_grad():
             img_stats = fake_img.detach().float()
             logs = {
                 "G/loss": g_loss.item(),
                 "G/img_mean": img_stats.mean().item(),
-                "G/img_std": img_stats.std().item(),
+                "G/img_std": img_stats.std().item(),  # std → 0 signals G collapse
             }
 
-        # Skip PL until step >= pl_warmup: mean_path_length starts at 0, making pl_loss=pl_lengths² at init.
+        # Skip PL until warmup: mean_path_length starts at 0, so pl_loss = pl_lengths² at first step.
         pl_warmup = getattr(cfg, "pl_warmup_steps", 0)
         if self.step % cfg.g_reg_interval == 0 and self.step >= pl_warmup:
             z_pl = self._sample_z(max(1, cfg.batch_size // 2))
-            # Differentiate synthesis only: run mapping under no_grad, make w a leaf.
+            # Differentiate synthesis only: run mapping under no_grad, promote w to a leaf.
             with torch.no_grad():
                 w_pl = self.G.mapping(z_pl)
             w_pl = w_pl.detach().requires_grad_(True)
@@ -269,19 +239,15 @@ class Trainer:
                 "step_time_s": time.perf_counter() - t0,
             }
 
-            # — logging —
             if self.step % cfg.log_interval == 0:
                 kimg = self.step * cfg.batch_size / 1000
                 _print_logs(self.step, kimg, logs)
-
                 if wandb_run is not None:
                     wandb_run.log({"kimg": kimg, **logs}, step=self.step)
 
-            # — samples —
             if self.step % cfg.sample_interval == 0 and wandb_run is not None:
                 self._log_samples(wandb_run, n=16)
 
-            # — FID —
             if self.step % cfg.fid_interval == 0 and self.step > 0:
                 fid = fid_cache.compute(
                     self.G,
@@ -292,7 +258,6 @@ class Trainer:
                 if wandb_run is not None:
                     wandb_run.log({"FID": fid}, step=self.step)
 
-            # — checkpoint —
             if self.step % cfg.save_interval == 0 and self.step > 0:
                 path = os.path.join(ckpt_dir, f"ckpt_{cfg.resolution}_{self.step:07d}.pth")
                 wandb_id = wandb_run.id if wandb_run is not None else None
@@ -300,7 +265,6 @@ class Trainer:
                 if drive_backup_dir:
                     _backup_to_drive(path, drive_backup_dir)
 
-        # Final checkpoint
         path = os.path.join(ckpt_dir, f"ckpt_{cfg.resolution}_final.pth")
         wandb_id = wandb_run.id if wandb_run is not None else None
         self.save(path, wandb_run_id=wandb_id)
@@ -326,15 +290,14 @@ class Trainer:
         print(f"  [ckpt] saved → {path}")
 
     def load(self, path: str, strict: bool = True) -> Optional[str]:
-        """Load checkpoint, return saved WandB run ID."""
+        """Load checkpoint. Returns the saved WandB run ID."""
         state = torch.load(path, map_location=self.device)
         self.G.load_state_dict(state["G"], strict=strict)
         self.D.load_state_dict(state["D"], strict=strict)
         if strict:
             self.g_optim.load_state_dict(state["g_optim"])
             self.d_optim.load_state_dict(state["d_optim"])
-            # load_state_dict restores saved LR, overriding cfg.  Re-apply cfg LR
-            # so that changing lr_g/lr_d in the yaml takes effect on resume.
+            # Re-apply cfg LR: load_state_dict restores the saved LR, so yaml changes won't take effect otherwise.
             g_ratio = self.cfg.g_reg_interval / (self.cfg.g_reg_interval + 1)
             d_ratio = self.cfg.d_reg_interval / (self.cfg.d_reg_interval + 1)
             for pg in self.g_optim.param_groups:
@@ -357,14 +320,12 @@ class Trainer:
         self.G.eval()
         try:
             z = torch.randn(n, self.cfg.z_dim, device=self.device)
-            imgs = self.G(z, noise_mode="const")      # [-1, 1], reproducible
-            imgs = (imgs.clamp(-1, 1) + 1) / 2       # [0, 1]
+            imgs = self.G(z, noise_mode="const")      # const: reproducible across steps
+            imgs = (imgs.clamp(-1, 1) + 1) / 2
             grid = _make_grid(imgs.cpu(), nrow=int(n ** 0.5))
             wandb_run.log({"samples": wandb.Image(grid)}, step=self.step)
         finally:
-            # Always restore train mode — an exception here would otherwise
-            # leave G in eval mode and corrupt subsequent training steps.
-            self.G.train()
+            self.G.train()  # always restore — eval mode left behind would corrupt subsequent training
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +377,11 @@ def restore_from_drive(
     local_ckpt_dir: str,
     resolution: int,
 ) -> bool:
-    """Copy the latest Drive checkpoint to local disk and load it; return False if none found."""
+    """Copy the latest Drive checkpoint to local disk and load it.
+
+    Returns False when no checkpoint is found (caller should start fresh or
+    load from a lower-resolution checkpoint instead).
+    """
     drive_path = find_latest_checkpoint(drive_ckpt_dir, resolution)
     if drive_path is None:
         print(f"  [restore] No checkpoint found in {drive_ckpt_dir} for res={resolution} → starting fresh.")

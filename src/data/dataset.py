@@ -1,20 +1,10 @@
 """FFHQ dataset loader.
 
-Supports two directory layouts:
+Two directory layouts are supported:
+  flat dir   — pass split='train'/'valid'/'test' to filter by numeric filename range
+               (train: 0–49999, valid: 50000–59999, test: 60000–69999)
+  split dir  — pass split=None to load all images in root (train_50k_{res}.zip layout)
 
-1. **Flat single directory** (all splits in one folder):
-       <root>/00000.jpg … 69999.jpg
-   Pass `split` to select the index range:
-       train: 0 – 49999 | valid: 50000 – 59999 | test: 60000 – 69999
-
-2. **Pre-split directories** (separate folder per split, 0-indexed):
-       <train_root>/00000.jpg … 49999.jpg
-       <valid_root>/00000.jpg …  9999.jpg
-   Pass `split=None` to load ALL images in root (no index filtering).
-   This is the mode used when train_50k_256.zip / valid_10k_256.zip are
-   extracted into separate folders.
-
-`aug` enables random horizontal flip (applied only for training).
 Images are returned as float32 tensors in [-1, 1].
 """
 
@@ -39,14 +29,14 @@ _SPLIT_RANGES: dict[str, tuple[int, int]] = {
 
 
 class FFHQDataset(Dataset):
-    """FFHQ face dataset.
+    """FFHQ face dataset with support for flat and pre-split directories.
 
     Args:
         root:       Directory containing extracted image files.
-        split:      "train" | "valid" | "test" to filter by index range, or
-                    None to load every image in root (use with pre-split dirs).
+        split:      "train" | "valid" | "test" to filter by filename index, or
+                    None to load every image (use with pre-split directories).
         resolution: Resize images to this square resolution.
-        aug:        Apply random horizontal flip (train augmentation).
+        aug:        Apply random horizontal flip (training augmentation).
     """
 
     def __init__(
@@ -67,7 +57,6 @@ class FFHQDataset(Dataset):
         )
 
         if split is None:
-            # Pre-split directory: load everything, no index filter
             self.files = [f for f in all_files if _is_numeric(f)]
         else:
             lo, hi = _SPLIT_RANGES[split]
@@ -75,17 +64,14 @@ class FFHQDataset(Dataset):
                 f for f in all_files
                 if _is_numeric(f) and lo <= int(f.stem) < hi
             ]
-            # Fallback: if nothing matched the range, the root is probably a
-            # pre-split directory already (images numbered from 0).
             if len(self.files) == 0:
+                # Root is likely pre-split (filenames start from 0, not FFHQ global indices).
                 self.files = [f for f in all_files if _is_numeric(f)]
                 if self.files:
                     import warnings
                     warnings.warn(
-                        f"No images matched split='{split}' index range "
-                        f"({lo}–{hi-1}) in {self.root}. "
-                        f"Loading all {len(self.files)} images instead "
-                        "(assuming pre-split directory)."
+                        f"No images matched split='{split}' range ({lo}–{hi-1}) in {self.root}. "
+                        f"Loading all {len(self.files)} images (assuming pre-split directory)."
                     )
 
         if len(self.files) == 0:
@@ -99,7 +85,7 @@ class FFHQDataset(Dataset):
             transform_list.append(T.RandomHorizontalFlip())
         transform_list += [
             T.ToTensor(),
-            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # [0,1] → [-1,1] to match tanh output
         ]
         self.transform = T.Compose(transform_list)
 
@@ -142,6 +128,6 @@ def build_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=shuffle,
+        drop_last=shuffle,  # keep batch size constant during training
         persistent_workers=(num_workers > 0 and persistent_workers),
     )

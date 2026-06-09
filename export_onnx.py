@@ -162,15 +162,22 @@ class _LegacyGenerator(nn.Module):
             self.blocks.append(_LegacyBlock(in_ch, nf(res), w_dim))
             in_ch = nf(res)
 
+        # Precompute const noise at init time (seeded, same as noise_mode="const").
+        # Stored as plain tensor attributes (not buffers) so state_dict is unaffected.
+        def _cn(h, idx=0):
+            g = torch.Generator().manual_seed(h * 2000 + h * 2 + idx)
+            return torch.randn(1, 1, h, h, generator=g)
+
+        self._n_b4 = _cn(4, 0)
+        self._n_blocks = [(_cn(8 * (2 ** i), 0), _cn(8 * (2 ** i), 1))
+                          for i in range(self.log2_res - 2)]
+
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         w = self.mapping(z)
-
-        def _z(h, ww): return torch.zeros(1, 1, h, ww, device=z.device)
-
-        x, rgb = self.b4(w, _z(4, 4))
+        x, rgb = self.b4(w, self._n_b4)
         for i, blk in enumerate(self.blocks):
-            h = 8 * (2 ** i)
-            x, rgb = blk(x, rgb, w, _z(h, h), _z(h, h))
+            n0, n1 = self._n_blocks[i]
+            x, rgb = blk(x, rgb, w, n0, n1)
         return torch.tanh(rgb)
 
 

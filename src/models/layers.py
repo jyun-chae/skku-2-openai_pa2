@@ -10,12 +10,22 @@ import torch.nn.functional as F
 
 
 class PixelNorm(nn.Module):
+    """Feature-wise L2 normalization applied to z before the mapping network.
+
+    Prevents z magnitude from dominating the first mapping layer.
+    """
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(dim=1, keepdim=True) + 1e-8)
 
 
 class EqualLinear(nn.Module):
-    """Linear layer with equalized learning rate."""
+    """Linear layer with equalized learning rate.
+
+    Weights are stored unscaled and multiplied by He-init scale at runtime.
+    This keeps all parameters at a similar magnitude so Adam's adaptive LR
+    works uniformly across layers regardless of fan-in size.
+    """
 
     def __init__(
         self,
@@ -37,12 +47,12 @@ class EqualLinear(nn.Module):
         bias = self.bias * self.lr_mul if self.bias is not None else None
         out = F.linear(x, self.weight * self.scale, bias)
         if self.activation == "fused_lrelu":
-            out = F.leaky_relu(out, 0.2) * math.sqrt(2)  # sqrt(2) restores ~unit variance post-LReLU (matches official impl)
+            out = F.leaky_relu(out, 0.2) * math.sqrt(2)  # sqrt(2): restores ~unit variance after LReLU
         return out
 
 
 class EqualConv2d(nn.Module):
-    """Conv2d with equalized learning rate (used in the discriminator)."""
+    """Conv2d with equalized learning rate (used in discriminator and SqueezeConnection)."""
 
     def __init__(
         self,
@@ -68,7 +78,11 @@ class EqualConv2d(nn.Module):
 
 
 class ModulatedConv2d(nn.Module):
-    """StyleGAN2 per-sample weight modulation + demodulation conv."""
+    """StyleGAN2 per-sample weight modulation + demodulation conv.
+
+    For each sample, the affine-transformed w modulates the shared weights,
+    then demodulation normalizes out the accumulated variance.
+    """
 
     def __init__(
         self,
@@ -89,8 +103,7 @@ class ModulatedConv2d(nn.Module):
         self.scale = 1.0 / math.sqrt(in_ch * kernel**2)
 
         self.weight = nn.Parameter(torch.randn(1, out_ch, in_ch, kernel, kernel))
-        # bias_init=1.0 → initial style is identity-like (no modulation effect)
-        self.affine = EqualLinear(w_dim, in_ch, bias_init=1.0)
+        self.affine = EqualLinear(w_dim, in_ch, bias_init=1.0)  # bias_init=1: identity modulation at init
 
     def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         b, c, h, width = x.shape
@@ -99,10 +112,8 @@ class ModulatedConv2d(nn.Module):
         weight = self.weight * self.scale * style
 
         if self.demodulate:
-            # MUST run in fp32: fp16 accumulates (in_ch * k²) squares.
-            # With 512 channels and 3×3 kernel that is 4608 terms; values
-            # around 10 give 10² × 4608 ≈ 460k, well above fp16 max (65504).
-            # rsqrt(inf) = 0 silently zeros every weight without NaN.
+            # fp32 required: 512ch × 3×3 = 4608 squared terms; values ~10 → 460k > fp16 max (65504).
+            # rsqrt(inf)=0 silently zeros every weight — no NaN raised, training dies without warning.
             w32 = weight.float()
             d = (w32.pow(2).sum(dim=[2, 3, 4]) + 1e-8).rsqrt()
             weight = (w32 * d.view(b, self.out_ch, 1, 1, 1)).to(x.dtype)
@@ -111,6 +122,7 @@ class ModulatedConv2d(nn.Module):
             x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
             h, width = x.shape[2], x.shape[3]
 
+        # groups=b fuses per-sample weights into a single grouped conv call
         x = x.reshape(1, b * c, h, width)
         weight = weight.reshape(b * self.out_ch, c, self.kernel, self.kernel)
         x = F.conv2d(x, weight, padding=self.padding, groups=b)
@@ -118,6 +130,11 @@ class ModulatedConv2d(nn.Module):
 
 
 class NoiseInjection(nn.Module):
+    """Adds spatially-varying stochastic noise scaled by a learned per-layer weight.
+
+    The weight starts at zero so noise has no effect at initialization,
+    allowing the network to opt in to noise as training progresses.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -131,6 +148,7 @@ class NoiseInjection(nn.Module):
 
 
 class ToRGB(nn.Module):
+    """Projects feature maps to 3-channel RGB via a 1×1 modulated conv (no demodulation)."""
 
     def __init__(self, in_ch: int, w_dim: int) -> None:
         super().__init__()
@@ -142,26 +160,24 @@ class ToRGB(nn.Module):
 
 
 class SqueezeConnection(nn.Module):
-    """Image squeeze connection from StyleGAN-Small (arXiv:2407.05527).
+    """Replaces conv2 + ToRGB per synthesis block (StyleGAN-Small, arXiv:2407.05527).
 
-    Replaces the second ModulatedConv2d + ToRGB per block with a
-    squeeze-excitation path that reduces the toRGB information bottleneck:
-      1. Squeeze  : EqualConv2d(in_ch → in_ch//ratio, k=3)
-      2. Noise    : NoiseInjection on squeezed features (restores conv2 stochasticity)
-      3. ToRGB    : generate RGB from squeezed features
-      4. Excite   : EqualConv2d(in_ch//ratio → in_ch, k=3)
-      5. Project  : EqualConv2d(2*in_ch → in_ch, k=1) on cat(x, excited)
+    Standard StyleGAN2 projects c channels directly to 3-channel RGB, losing spatial
+    information through the narrow bottleneck. SqueezeConnection reduces that bottleneck
+    by routing RGB generation through c/8 squeezed features:
 
-    The projected output replaces x for the next block, enriching the
-    feature flow while using fewer parameters than conv2+ToRGB.
+        squeeze(c → c/8) → noise → to_rgb
+        excite(c/8 → c) → project(cat(x, excite) → c)
+
+    The excite+project path merges the squeezed spatial context back into the feature
+    stream for the next block, replacing the functionality of conv2.
     """
 
     def __init__(self, in_ch: int, w_dim: int, ratio: int = 8) -> None:
         super().__init__()
-        # Floor at 8 prevents degenerate 1–2 ch squeeze at small in_ch (e.g. 64//8=8 is fine, 32//8=4 is not).
-        s_ch = max(in_ch // ratio, 8)
+        s_ch = max(in_ch // ratio, 8)  # floor at 8: prevents degenerate 1–2 ch squeeze at low resolutions
         self.squeeze = EqualConv2d(in_ch, s_ch, kernel=3, padding=1)
-        self.noise   = NoiseInjection()   # replaces noise2 that was removed with conv2
+        self.noise   = NoiseInjection()   # restores stochasticity removed by eliminating conv2
         self.to_rgb  = ToRGB(s_ch, w_dim)
         self.excite  = EqualConv2d(s_ch, in_ch, kernel=3, padding=1)
         self.proj    = EqualConv2d(in_ch * 2, in_ch, kernel=1)

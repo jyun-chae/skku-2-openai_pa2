@@ -1,14 +1,10 @@
-"""StyleGAN2 Generator with Squeeze Connection synthesis blocks.
+"""StyleGAN2 Generator with SqueezeConnection synthesis blocks.
 
-Channel schedule (channel_base=131072, channel_max=512):
+Channel schedule  (channel_base=131072, channel_max=512):
   res:      4    8   16   32   64  128  256  512 1024
   channels: 512 512  512  512  512  512  512  256  128
 
-mapping_layers=12, w_dim=640, squeeze_ratio=8.
-
-Squeeze connection (StyleGAN-Small, arXiv:2407.05527) replaces conv2+ToRGB
-with squeeze→excite→project path, improving the toRGB information bottleneck.
-PyTorch params @ 1024: ~34.10M.  ONNX initializer count: ~35.5M (<40M limit).
+PyTorch params @ 1024: ~34.10M.  ONNX initializer count: ~35.5M (< 50M limit).
 """
 
 from __future__ import annotations
@@ -28,7 +24,7 @@ from .layers import EqualLinear, ModulatedConv2d, NoiseInjection, PixelNorm, Squ
 # ---------------------------------------------------------------------------
 
 def _nf(resolution: int, channel_base: int = 131072, channel_max: int = 512) -> int:
-    """Number of feature maps at a given resolution (StyleGAN2 schedule)."""
+    """Channel count at a given resolution following the StyleGAN2 schedule."""
     return min(channel_max, int(channel_base / resolution))
 
 
@@ -41,7 +37,11 @@ def _log2(n: int) -> int:
 # ---------------------------------------------------------------------------
 
 class MappingNetwork(nn.Module):
-    """Maps z → disentangled w via an 8-layer EqualLinear MLP."""
+    """Maps z → disentangled w via a deep EqualLinear MLP.
+
+    More layers (12 vs original 8) and low lr_mul improve disentanglement
+    and stabilize early training at the cost of a small parameter overhead.
+    """
 
     def __init__(
         self,
@@ -70,6 +70,7 @@ class MappingNetwork(nn.Module):
 
     @torch.no_grad()
     def mean_latent(self, n_samples: int = 4096, device: str = "cuda") -> torch.Tensor:
+        """Estimate the mean w vector used as the truncation anchor."""
         z = torch.randn(n_samples, self.z_dim, device=device)
         return self.net(z).mean(dim=0, keepdim=True)
 
@@ -79,6 +80,7 @@ class MappingNetwork(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SynthesisBlock4(nn.Module):
+    """4×4 base block: learned constant input → conv → SqueezeConnection."""
 
     def __init__(self, out_ch: int, w_dim: int, squeeze_ratio: int = 8) -> None:
         super().__init__()
@@ -104,7 +106,11 @@ class SynthesisBlock4(nn.Module):
 
 
 class SynthesisBlock(nn.Module):
-    """Upsample block with squeeze connection replacing conv2 + ToRGB."""
+    """Upsample block: conv1(upsample) → noise → SqueezeConnection.
+
+    SqueezeConnection replaces the original conv2 + ToRGB, reducing per-block
+    parameters while alleviating the RGB projection bottleneck.
+    """
 
     def __init__(self, in_ch: int, out_ch: int, w_dim: int, squeeze_ratio: int = 8) -> None:
         super().__init__()
@@ -126,6 +132,7 @@ class SynthesisBlock(nn.Module):
         x = self.act(x) * math.sqrt(2)
 
         x, rgb_cur = self.squeeze(x, w, squeeze_noise)
+        # accumulate RGB progressively: each block adds its contribution to the upsampled previous RGB
         prev_rgb_up = F.interpolate(prev_rgb, scale_factor=2, mode="bilinear", align_corners=False)
         rgb = prev_rgb_up + rgb_cur
         return x, rgb
@@ -142,11 +149,11 @@ class StyleGAN2Generator(nn.Module):
         resolution:     Output resolution — 256, 512, or 1024.
         z_dim:          Input noise dimension.
         w_dim:          Intermediate latent dimension (w-space).
-        channel_base:   Controls channel schedule: nf(r) = min(channel_max, channel_base/r).
+        channel_base:   Channel schedule base: nf(r) = min(channel_max, channel_base/r).
         channel_max:    Hard cap on channels per layer.
-        mapping_layers: Depth of the mapping MLP (more → better disentanglement).
+        mapping_layers: Depth of the mapping MLP.
         mapping_lr_mul: LR multiplier for mapping network (low → slower, more stable).
-        squeeze_ratio:  Squeeze compression ratio in SqueezeConnection (default 8).
+        squeeze_ratio:  Squeeze compression ratio in SqueezeConnection.
     """
 
     def __init__(
@@ -171,7 +178,6 @@ class StyleGAN2Generator(nn.Module):
             return _nf(r, channel_base, channel_max)
 
         self.mapping = MappingNetwork(z_dim, w_dim, mapping_layers, mapping_lr_mul)
-
         self.b4 = SynthesisBlock4(nf(4), w_dim, squeeze_ratio)
 
         self.blocks = nn.ModuleList()
@@ -182,16 +188,19 @@ class StyleGAN2Generator(nn.Module):
             self.blocks.append(SynthesisBlock(in_ch, out_ch, w_dim, squeeze_ratio))
             in_ch = out_ch
 
-        self.num_ws = 1 + len(self.blocks)
+        self.num_ws = 1 + len(self.blocks)  # 1 for b4 + 1 per upsample block
 
     # ------------------------------------------------------------------
-    def _w_broadcast(self, w: torch.Tensor) -> list[torch.Tensor]:
-        """Return a list of per-block w tensors (all the same for non-mixing)."""
-        return [w] * self.num_ws
 
     def _synthesis(self, w: torch.Tensor, noise_mode: str) -> torch.Tensor:
-        """Run synthesis network given a w vector (no mapping)."""
-        ws = self._w_broadcast(w)
+        """Run synthesis given a single w vector (no style mixing).
+
+        noise_mode:
+          'random' — fresh noise each call (training default)
+          'const'  — seeded deterministic noise (reproducible sample grids)
+          'none'   — zero noise (required for ONNX; constant-folded away)
+        """
+        ws = [w] * self.num_ws
         b = w.shape[0]
 
         def _noise(h: int, ww: int, idx: int = 0) -> Optional[torch.Tensor]:
@@ -201,7 +210,7 @@ class StyleGAN2Generator(nn.Module):
                 seed = h * 2000 + ww * 2 + idx
                 g = torch.Generator(device=w.device).manual_seed(seed)
                 return torch.randn(1, 1, h, ww, generator=g, device=w.device).expand(b, -1, -1, -1)
-            return None   # NoiseInjection samples dynamically (training default)
+            return None  # NoiseInjection samples dynamically
 
         x, rgb = self.b4(ws[0], _noise(4, 4, 0), _noise(4, 4, 1))
         for i, block in enumerate(self.blocks):
@@ -225,8 +234,8 @@ class StyleGAN2Generator(nn.Module):
             w:          Pre-computed w [B, w_dim].  Skips mapping when provided.
             noise_mode: "random" | "const" | "none".
             truncation: Truncation psi (applied only when z is given).
-            mean_w:     Pre-computed mean w for truncation.
-            return_w:   Also return the w tensor (only meaningful when z is given).
+            mean_w:     Pre-computed mean w for truncation (from mean_latent()).
+            return_w:   Also return the w tensor.
         """
         if w is None:
             w = self.mapping(z, truncation=truncation, mean_w=mean_w)
@@ -238,8 +247,13 @@ class StyleGAN2Generator(nn.Module):
         return img
 
     # ------------------------------------------------------------------
+
     def export_onnx(self, path: str, batch_size: int = 1) -> int:
-        """Export generator to ONNX with zero noise for a deterministic graph."""
+        """Export to ONNX with zero noise for a deterministic graph.
+
+        Returns the ONNX initializer count (slightly > PyTorch param count because
+        do_constant_folding bakes EqualLinear weight×scale products as extra initializers).
+        """
         import numpy as np
         import onnx
 
@@ -247,17 +261,16 @@ class StyleGAN2Generator(nn.Module):
             def __init__(self, G: "StyleGAN2Generator") -> None:
                 super().__init__()
                 self.G = G
+
             def forward(self, z: torch.Tensor) -> torch.Tensor:
                 return self.G(z, noise_mode="none")
 
         self.eval()
         device = next(self.parameters()).device
 
-        wrapper = _NoNoiseWrapper(self)
-        wrapper.eval()
-        # CPU: do_constant_folding mixes GPU tensors with CPU intermediates → RuntimeError on CUDA.
-        wrapper.cpu()
-        dummy_z = torch.randn(1, self.z_dim, device="cpu")
+        wrapper = _NoNoiseWrapper(self).eval()
+        wrapper.cpu()  # do_constant_folding mixes CPU/GPU tensors on CUDA → RuntimeError
+        dummy_z = torch.randn(batch_size, self.z_dim, device="cpu")
 
         torch.onnx.export(
             wrapper,
@@ -267,7 +280,7 @@ class StyleGAN2Generator(nn.Module):
             input_names=["z"],
             output_names=["image"],
             do_constant_folding=True,
-            dynamo=False,  # dynamo path uses groups=B which ONNX opset 17 cannot represent
+            dynamo=False,  # dynamo emits groups=B which ONNX opset 17 cannot represent
         )
         wrapper.to(device)
 
@@ -277,32 +290,16 @@ class StyleGAN2Generator(nn.Module):
         status = "OK" if onnx_params < limit else "OVER LIMIT"
         print(f"ONNX exported → {path}")
         print(f"  ONNX parameters: {onnx_params:,} ({onnx_params/1e6:.3f}M)  [{status}]")
-        assert onnx_params < limit, f"ONNX exceeds 40M limit! ({onnx_params:,})"
+        assert onnx_params < limit, f"ONNX exceeds 50M limit! ({onnx_params:,})"
         return onnx_params
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def load_from_lower_resolution(self, state_dict: dict, freeze_existing: bool = False) -> None:
-        """Load weights from a lower-resolution checkpoint; new higher-res blocks stay random-init.
-
-        Args:
-            state_dict:      G state dict from the previous-stage checkpoint.
-            freeze_existing: If True, freeze all loaded params (requires_grad=False).
-                             Call trainer.rebuild_optimizers() afterwards so frozen
-                             params are excluded from the optimizer.
-        """
+    def load_from_lower_resolution(self, state_dict: dict) -> None:
+        """Load weights from a lower-res checkpoint; new higher-res blocks stay random-init."""
         own = self.state_dict()
         filtered = {k: v for k, v in state_dict.items() if k in own and own[k].shape == v.shape}
         own.update(filtered)
         self.load_state_dict(own)
         print(f"Loaded {len(filtered)}/{len(own)} tensors from lower-resolution checkpoint.")
-
-        if freeze_existing and filtered:
-            frozen = 0
-            for name, param in self.named_parameters():
-                if name in filtered:
-                    param.requires_grad_(False)
-                    frozen += 1
-            trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            print(f"  Froze {frozen} param tensors. G trainable: {trainable:,}")

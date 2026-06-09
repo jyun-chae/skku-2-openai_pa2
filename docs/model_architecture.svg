@@ -1,0 +1,251 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1120" viewBox="0 0 1600 1120" role="img" aria-labelledby="title desc">
+  <title id="title">Current Model Architecture: StyleGAN2 with SqueezeConnection</title>
+  <desc id="desc">Architecture diagram for the repository model: StyleGAN2 generator with SqueezeConnection synthesis blocks and a residual StyleGAN2 discriminator.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#2563eb"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .panel-title { font: 700 26px Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 16px Arial, sans-serif; fill: #475569; }
+      .label { font: 700 16px Arial, sans-serif; fill: #0f172a; }
+      .small { font: 400 13px Arial, sans-serif; fill: #334155; }
+      .tiny { font: 400 12px Arial, sans-serif; fill: #475569; }
+      .box { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.4; rx: 8; }
+      .box-blue { fill: #dbeafe; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-green { fill: #dcfce7; stroke: #16a34a; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fef3c7; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .box-red { fill: #fee2e2; stroke: #dc2626; stroke-width: 1.6; rx: 8; }
+      .box-violet { fill: #ede9fe; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .line { stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .line-blue { stroke: #2563eb; stroke-width: 2.2; fill: none; marker-end: url(#arrow-blue); }
+      .skip { stroke: #2563eb; stroke-width: 2; fill: none; stroke-dasharray: 7 6; marker-end: url(#arrow-blue); }
+      .table-head { fill: #e2e8f0; stroke: #94a3b8; stroke-width: 1; }
+      .table-cell { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1; }
+      .mono { font: 700 13px Consolas, 'Courier New', monospace; fill: #0f172a; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1120"/>
+
+  <text x="60" y="55" class="panel-title">Current Model Architecture</text>
+  <text x="60" y="82" class="subtitle">StyleGAN2 Generator + SqueezeConnection synthesis, paired with a residual StyleGAN2 Discriminator. Final config targets 1024 x 1024 output.</text>
+
+  <rect class="panel" x="40" y="115" width="1520" height="425" rx="12"/>
+  <text x="70" y="155" class="panel-title">Generator: StyleGAN2Generator</text>
+  <text x="70" y="180" class="subtitle">z_dim=512, w_dim=640, mapping_layers=12, channel_base=131072, channel_max=512, squeeze_ratio=8</text>
+
+  <rect class="box-blue" x="70" y="225" width="130" height="70"/>
+  <text x="135" y="252" text-anchor="middle" class="label">Latent z</text>
+  <text x="135" y="275" text-anchor="middle" class="small">[B, 512]</text>
+
+  <path class="line" d="M200 260 H250"/>
+
+  <rect class="box-blue" x="250" y="210" width="225" height="100"/>
+  <text x="362.5" y="238" text-anchor="middle" class="label">Mapping Network</text>
+  <text x="362.5" y="263" text-anchor="middle" class="small">PixelNorm</text>
+  <text x="362.5" y="284" text-anchor="middle" class="small">12 x EqualLinear + LReLU</text>
+
+  <path class="line" d="M475 260 H525"/>
+
+  <rect class="box-violet" x="525" y="225" width="150" height="70"/>
+  <text x="600" y="252" text-anchor="middle" class="label">w</text>
+  <text x="600" y="275" text-anchor="middle" class="small">[B, 640]</text>
+
+  <path class="line" d="M675 260 H725"/>
+
+  <rect class="box-green" x="725" y="205" width="175" height="110"/>
+  <text x="812.5" y="236" text-anchor="middle" class="label">Block 4 x 4</text>
+  <text x="812.5" y="260" text-anchor="middle" class="small">learned const 512ch</text>
+  <text x="812.5" y="281" text-anchor="middle" class="small">ModConv + noise</text>
+  <text x="812.5" y="302" text-anchor="middle" class="small">SqueezeConnection</text>
+
+  <path class="line" d="M900 260 H950"/>
+
+  <rect class="box-green" x="950" y="190" width="250" height="140"/>
+  <text x="1075" y="219" text-anchor="middle" class="label">Upsample Synthesis Blocks</text>
+  <text x="1075" y="245" text-anchor="middle" class="small">8, 16, 32, 64, 128, 256</text>
+  <text x="1075" y="267" text-anchor="middle" class="small">each 512 channels</text>
+  <text x="1075" y="293" text-anchor="middle" class="small">ModConv up + noise + LReLU</text>
+  <text x="1075" y="315" text-anchor="middle" class="small">then SqueezeConnection</text>
+
+  <path class="line" d="M1200 260 H1250"/>
+
+  <rect class="box-green" x="1250" y="190" width="170" height="140"/>
+  <text x="1335" y="219" text-anchor="middle" class="label">High-res Blocks</text>
+  <text x="1335" y="245" text-anchor="middle" class="small">512 x 512: 256ch</text>
+  <text x="1335" y="267" text-anchor="middle" class="small">1024 x 1024: 128ch</text>
+  <text x="1335" y="293" text-anchor="middle" class="small">same block design</text>
+  <text x="1335" y="315" text-anchor="middle" class="small">RGB skip summed</text>
+
+  <path class="line" d="M1420 260 H1470"/>
+
+  <rect class="box-red" x="1470" y="225" width="65" height="70"/>
+  <text x="1502.5" y="253" text-anchor="middle" class="label">tanh</text>
+  <text x="1502.5" y="276" text-anchor="middle" class="tiny">image</text>
+
+  <path class="skip" d="M816 338 C890 405, 1030 405, 1080 338"/>
+  <text x="955" y="415" text-anchor="middle" class="small">per-block RGB output is bilinear-upsampled and added to the next RGB</text>
+
+  <rect class="table-head" x="70" y="455" width="142" height="32"/>
+  <text x="141" y="476" text-anchor="middle" class="mono">Resolution</text>
+  <rect class="table-cell" x="212" y="455" width="105" height="32"/>
+  <text x="264.5" y="476" text-anchor="middle" class="mono">4</text>
+  <rect class="table-cell" x="317" y="455" width="105" height="32"/>
+  <text x="369.5" y="476" text-anchor="middle" class="mono">8</text>
+  <rect class="table-cell" x="422" y="455" width="105" height="32"/>
+  <text x="474.5" y="476" text-anchor="middle" class="mono">16</text>
+  <rect class="table-cell" x="527" y="455" width="105" height="32"/>
+  <text x="579.5" y="476" text-anchor="middle" class="mono">32</text>
+  <rect class="table-cell" x="632" y="455" width="105" height="32"/>
+  <text x="684.5" y="476" text-anchor="middle" class="mono">64</text>
+  <rect class="table-cell" x="737" y="455" width="105" height="32"/>
+  <text x="789.5" y="476" text-anchor="middle" class="mono">128</text>
+  <rect class="table-cell" x="842" y="455" width="105" height="32"/>
+  <text x="894.5" y="476" text-anchor="middle" class="mono">256</text>
+  <rect class="table-cell" x="947" y="455" width="105" height="32"/>
+  <text x="999.5" y="476" text-anchor="middle" class="mono">512</text>
+  <rect class="table-cell" x="1052" y="455" width="105" height="32"/>
+  <text x="1104.5" y="476" text-anchor="middle" class="mono">1024</text>
+  <rect class="table-head" x="70" y="487" width="142" height="32"/>
+  <text x="141" y="508" text-anchor="middle" class="mono">Channels</text>
+  <rect class="table-cell" x="212" y="487" width="105" height="32"/>
+  <text x="264.5" y="508" text-anchor="middle" class="mono">512</text>
+  <rect class="table-cell" x="317" y="487" width="105" height="32"/>
+  <text x="369.5" y="508" text-anchor="middle" class="mono">512</text>
+  <rect class="table-cell" x="422" y="487" width="105" height="32"/>
+  <text x="474.5" y="508" text-anchor="middle" class="mono">512</text>
+  <rect class="table-cell" x="527" y="487" width="105" height="32"/>
+  <text x="579.5" y="508" text-anchor="middle" class="mono">512</text>
+  <rect class="table-cell" x="632" y="487" width="105" height="32"/>
+  <text x="684.5" y="508" text-anchor="middle" class="mono">512</text>
+  <rect class="table-cell" x="737" y="487" width="105" height="32"/>
+  <text x="789.5" y="508" text-anchor="middle" class="mono">512</text>
+  <rect class="table-cell" x="842" y="487" width="105" height="32"/>
+  <text x="894.5" y="508" text-anchor="middle" class="mono">512</text>
+  <rect class="table-cell" x="947" y="487" width="105" height="32"/>
+  <text x="999.5" y="508" text-anchor="middle" class="mono">256</text>
+  <rect class="table-cell" x="1052" y="487" width="105" height="32"/>
+  <text x="1104.5" y="508" text-anchor="middle" class="mono">128</text>
+  <text x="1185" y="477" class="small">For 256 or 512 training, the same generator stops at that target resolution.</text>
+  <text x="1185" y="502" class="small">num_ws = 1 + number of upsample blocks.</text>
+
+  <rect class="panel" x="40" y="570" width="735" height="490" rx="12"/>
+  <text x="70" y="610" class="panel-title">SqueezeConnection Detail</text>
+  <text x="70" y="635" class="subtitle">Replaces the second StyleGAN2 conv + ToRGB path inside each synthesis block.</text>
+
+  <rect class="box" x="90" y="700" width="120" height="64"/>
+  <text x="150" y="727" text-anchor="middle" class="label">x</text>
+  <text x="150" y="750" text-anchor="middle" class="small">C channels</text>
+
+  <path class="line" d="M210 732 H255"/>
+
+  <rect class="box-amber" x="255" y="685" width="140" height="94"/>
+  <text x="325" y="715" text-anchor="middle" class="label">Squeeze</text>
+  <text x="325" y="739" text-anchor="middle" class="small">EqualConv 3x3</text>
+  <text x="325" y="760" text-anchor="middle" class="small">C -> max(C/8, 8)</text>
+
+  <path class="line" d="M395 732 H440"/>
+
+  <rect class="box-amber" x="440" y="700" width="115" height="64"/>
+  <text x="497.5" y="727" text-anchor="middle" class="label">Noise</text>
+  <text x="497.5" y="750" text-anchor="middle" class="small">learned scale</text>
+
+  <path class="line" d="M555 732 H600"/>
+
+  <rect class="box-red" x="600" y="690" width="125" height="84"/>
+  <text x="662.5" y="718" text-anchor="middle" class="label">ToRGB</text>
+  <text x="662.5" y="742" text-anchor="middle" class="small">ModConv 1x1</text>
+  <text x="662.5" y="763" text-anchor="middle" class="small">uses w</text>
+
+  <path class="line-blue" d="M497 765 V835 H585"/>
+  <rect class="box-green" x="585" y="803" width="140" height="64"/>
+  <text x="655" y="829" text-anchor="middle" class="label">Excite</text>
+  <text x="655" y="851" text-anchor="middle" class="small">s_ch -> C</text>
+
+  <path class="line-blue" d="M150 764 V930 H250"/>
+  <path class="line-blue" d="M655 867 V930 H250"/>
+
+  <rect class="box-green" x="250" y="893" width="180" height="74"/>
+  <text x="340" y="922" text-anchor="middle" class="label">Concat + Project</text>
+  <text x="340" y="945" text-anchor="middle" class="small">[x, excite] 2C -> C</text>
+
+  <path class="line" d="M430 930 H490"/>
+
+  <rect class="box" x="490" y="900" width="135" height="60"/>
+  <text x="557.5" y="925" text-anchor="middle" class="label">x_out</text>
+  <text x="557.5" y="947" text-anchor="middle" class="small">next block input</text>
+
+  <path class="line" d="M725 732 H745"/>
+  <rect class="box-red" x="620" y="915" width="125" height="60"/>
+  <text x="682.5" y="940" text-anchor="middle" class="label">rgb_cur</text>
+  <text x="682.5" y="962" text-anchor="middle" class="small">skip image</text>
+  <path class="line" d="M662 774 V915"/>
+
+  <text x="90" y="1015" class="small">Block 4 starts from a learned 4 x 4 constant. Later blocks first upsample with ModulatedConv2d, inject noise, apply LReLU, then run this module.</text>
+
+  <rect class="panel" x="815" y="570" width="745" height="490" rx="12"/>
+  <text x="845" y="610" class="panel-title">Discriminator: StyleGAN2Discriminator</text>
+  <text x="845" y="635" class="subtitle">Residual downsampling discriminator with minibatch stddev and two EqualLinear layers.</text>
+
+  <rect class="box-red" x="855" y="705" width="120" height="70"/>
+  <text x="915" y="733" text-anchor="middle" class="label">Image</text>
+  <text x="915" y="756" text-anchor="middle" class="small">3 x 1024 x 1024</text>
+
+  <path class="line" d="M975 740 H1025"/>
+
+  <rect class="box-red" x="1025" y="690" width="140" height="100"/>
+  <text x="1095" y="720" text-anchor="middle" class="label">FromRGB</text>
+  <text x="1095" y="745" text-anchor="middle" class="small">EqualConv 1x1</text>
+  <text x="1095" y="766" text-anchor="middle" class="small">3 -> 128ch</text>
+
+  <path class="line" d="M1165 740 H1215"/>
+
+  <rect class="box-blue" x="1215" y="660" width="270" height="160"/>
+  <text x="1350" y="690" text-anchor="middle" class="label">Residual DiscBlocks</text>
+  <text x="1350" y="716" text-anchor="middle" class="small">1024: 128 -> 256</text>
+  <text x="1350" y="738" text-anchor="middle" class="small">512: 256 -> 512</text>
+  <text x="1350" y="760" text-anchor="middle" class="small">256,128,64,32,16,8: 512 -> 512</text>
+  <text x="1350" y="788" text-anchor="middle" class="small">conv1, avgpool, conv2 + skip avgpool</text>
+
+  <path class="line" d="M1350 820 V865"/>
+
+  <rect class="box-violet" x="1260" y="865" width="180" height="70"/>
+  <text x="1350" y="893" text-anchor="middle" class="label">MinibatchStddev</text>
+  <text x="1350" y="916" text-anchor="middle" class="small">adds 1 feature channel</text>
+
+  <path class="line" d="M1260 900 H1195"/>
+
+  <rect class="box-blue" x="1035" y="865" width="160" height="70"/>
+  <text x="1115" y="892" text-anchor="middle" class="label">Conv 4 x 4</text>
+  <text x="1115" y="915" text-anchor="middle" class="small">EqualConv 3x3</text>
+
+  <path class="line" d="M1035 900 H970"/>
+
+  <rect class="box" x="875" y="865" width="95" height="70"/>
+  <text x="922.5" y="893" text-anchor="middle" class="label">Flatten</text>
+  <text x="922.5" y="916" text-anchor="middle" class="small">512*4*4</text>
+
+  <path class="line" d="M922 865 V830"/>
+
+  <rect class="box" x="855" y="790" width="135" height="40"/>
+  <text x="922.5" y="815" text-anchor="middle" class="label">EqualLinear</text>
+
+  <path class="line" d="M990 810 H1045"/>
+
+  <rect class="box" x="1045" y="790" width="130" height="40"/>
+  <text x="1110" y="815" text-anchor="middle" class="label">EqualLinear</text>
+
+  <path class="line" d="M1175 810 H1230"/>
+
+  <rect class="box-red" x="1230" y="790" width="95" height="40"/>
+  <text x="1277.5" y="815" text-anchor="middle" class="label">logit</text>
+
+  <text x="845" y="1000" class="small">DiscBlock residual branch: skip(avg_pool(x)) + conv2(avg_pool(LReLU(conv1(x)))), scaled by 1/sqrt(2).</text>
+  <text x="845" y="1025" class="small">Training uses D logistic + lazy R1, G non-saturating + lazy path-length regularization, AMP, and gradient clipping.</text>
+</svg>

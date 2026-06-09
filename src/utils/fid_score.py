@@ -1,15 +1,11 @@
-"""FID computation using pytorch-fid's InceptionV3 features.
+"""FID (Fréchet Inception Distance) using pytorch-fid's InceptionV3 (2048-d features).
 
-Computes FID between:
-  - real:  validation set images (cached once as (mu, sigma))
-  - fake:  n_gen images from the current generator
-
-All computation is in-memory; no temp files needed.
+Real validation statistics are cached once per session; fake stats recomputed each call.
+All computation is in-memory — no temp files needed.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import numpy as np
@@ -17,7 +13,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-# pytorch-fid exposes InceptionV3 and calculate_frechet_distance directly
 from pytorch_fid.inception import InceptionV3
 from pytorch_fid.fid_score import calculate_frechet_distance
 
@@ -26,6 +21,7 @@ from pytorch_fid.fid_score import calculate_frechet_distance
 # Inception feature extractor (singleton per device)
 # ---------------------------------------------------------------------------
 
+# Singleton cache avoids re-loading Inception weights on every FID call.
 _inception_cache: dict[str, nn.Module] = {}
 
 
@@ -39,7 +35,7 @@ def _get_inception(device: torch.device) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
-# Feature extraction
+# Feature extraction helpers
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -49,13 +45,13 @@ def _extract_features(
     device: torch.device,
     resize: int = 299,
 ) -> np.ndarray:
-    """Extract 2048-d Inception features for a batch of images."""
+    """Extract 2048-d Inception features. Resizes and rescales to [0,1] as InceptionV3 expects."""
     import torch.nn.functional as F
     imgs = imgs.to(device)
     if imgs.shape[-1] != resize:
         imgs = F.interpolate(imgs, size=(resize, resize), mode="bilinear", align_corners=False)
-    imgs = (imgs.clamp(-1, 1) + 1) / 2   # → [0, 1], what InceptionV3 expects
-    feats = inception(imgs)[0]            # [N, 2048, 1, 1]
+    imgs = (imgs.clamp(-1, 1) + 1) / 2  # [-1,1] → [0,1]
+    feats = inception(imgs)[0]           # [N, 2048, 1, 1]
     return feats.squeeze(-1).squeeze(-1).cpu().numpy()
 
 
@@ -94,9 +90,7 @@ def _gen_to_features(
 
 
 def _mu_sigma(feats: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    mu = feats.mean(axis=0)
-    sigma = np.cov(feats, rowvar=False)
-    return mu, sigma
+    return feats.mean(axis=0), np.cov(feats, rowvar=False)
 
 
 # ---------------------------------------------------------------------------
@@ -104,11 +98,11 @@ def _mu_sigma(feats: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 class ValidFIDCache:
-    """Pre-computes and caches real validation statistics.
+    """Pre-computes and caches real validation statistics for repeated FID calls.
 
     Usage:
         cache = ValidFIDCache(valid_loader, device)
-        fid = cache.compute(G)
+        fid = cache.compute(G, n_gen=10000, batch_size=16)
     """
 
     def __init__(self, valid_loader: DataLoader, device: torch.device) -> None:
@@ -135,7 +129,7 @@ def compute_fid_from_generator(
     device: Optional[torch.device] = None,
     batch_size: int = 16,
 ) -> float:
-    """One-shot FID computation (no caching). Prefer ValidFIDCache for repeated calls."""
+    """One-shot FID (no caching). Prefer ValidFIDCache for repeated calls."""
     if device is None:
         device = next(G.parameters()).device
     inception = _get_inception(device)
