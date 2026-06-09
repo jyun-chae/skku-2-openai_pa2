@@ -19,7 +19,8 @@ pl_decay: 0.01
 # mean_path_length is NOT transferred from the 256 checkpoint (different resolution
 # → different path lengths). Trainer starts fresh at 0, so a short warmup prevents
 # the first PL step from using target=0 against the loaded 256 model's path lengths.
-pl_warmup_steps: 500
+pl_warmup_steps: 0
+pl_batch_shrink: 4
 
 batch_size: 8
 num_workers: 4

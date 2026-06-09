@@ -174,7 +174,11 @@ class Trainer:
         # Skip PL until warmup: mean_path_length starts at 0, so pl_loss = pl_lengths² at first step.
         pl_warmup = getattr(cfg, "pl_warmup_steps", 0)
         if self.step % cfg.g_reg_interval == 0 and self.step >= pl_warmup:
-            z_pl = self._sample_z(max(1, cfg.batch_size // 2))
+            # pl_batch_shrink divides the PL batch size to reduce memory from
+            # create_graph=True + fp32: at 512px shrink=4 → batch 8→2, at 1024px shrink=8 → batch 4→1.
+            shrink = getattr(cfg, "pl_batch_shrink", 2)
+            torch.cuda.empty_cache()
+            z_pl = self._sample_z(max(1, cfg.batch_size // shrink))
             # Differentiate synthesis only: run mapping under no_grad, promote w to a leaf.
             with torch.no_grad():
                 w_pl = self.G.mapping(z_pl)

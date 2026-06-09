@@ -8,15 +8,16 @@ mapping_layers: 12
 mapping_lr_mul: 0.01
 
 lr_g: 0.001
-lr_d: 0.0005
+lr_d: 0.001
 grad_clip: 1.0
 
 d_reg_interval: 16
 g_reg_interval: 4
-r1_gamma: 30.0
+r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
-pl_warmup_steps: 500  # mean_path_length is NOT transferred from 512 ckpt (starts at 0)
+pl_warmup_steps: 0
+pl_batch_shrink: 4
 
 batch_size: 4
 num_workers: 4
