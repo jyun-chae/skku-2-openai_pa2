@@ -1,4 +1,4 @@
-# ── Resolution 1024×1024 (fine-tune from 512 checkpoint) ───────────────────
+# ── Resolution 1024×1024 (fine-tune from 512 checkpoint) ────────────────────
 resolution: 1024
 z_dim: 512
 w_dim: 640
@@ -16,8 +16,11 @@ g_reg_interval: 4
 r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
+# mean_path_length is NOT transferred from the 512 checkpoint (path-length scale differs by resolution).
+# pl_warmup_steps > 0 prevents the first PL step from targeting 0 when loading a higher-res model.
 pl_warmup_steps: 0
-pl_batch_shrink: 4
+pl_batch_shrink: 4   # batch 4 → 1 for PL step; create_graph+fp32 doubles VRAM
+r1_batch_shrink: 2   # batch 4 → 2 for R1 step
 
 batch_size: 4
 num_workers: 4

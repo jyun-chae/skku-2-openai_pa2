@@ -130,7 +130,11 @@ class Trainer:
 
         if self.step % cfg.d_reg_interval == 0:
             # R1 must run in fp32: fp16 grad.pow(2) overflows (512ch × 9 terms → ~460k > fp16 max), rsqrt(inf)=0 kills D.
-            real_img_r1 = real_img.detach().float().requires_grad_(True)
+            # r1_batch_shrink reduces the batch for R1 only: create_graph=True stores the full D activation graph;
+            # at 512px batch=8 the from_rgb output alone is 8×256×512×512×4 = 2 GiB, causing fragmentation OOM.
+            r1_shrink = getattr(cfg, "r1_batch_shrink", 1)
+            r1_n = max(1, real_img.shape[0] // r1_shrink)
+            real_img_r1 = real_img[:r1_n].detach().float().requires_grad_(True)
             with autocast("cuda", enabled=False):
                 real_pred_r1 = self.D(real_img_r1)
                 r1_penalty = d_r1_loss(real_pred_r1, real_img_r1)
@@ -171,14 +175,11 @@ class Trainer:
                 "G/img_std": img_stats.std().item(),  # std → 0 signals G collapse
             }
 
-        # Skip PL until warmup: mean_path_length starts at 0, so pl_loss = pl_lengths² at first step.
-        pl_warmup = getattr(cfg, "pl_warmup_steps", 0)
-        if self.step % cfg.g_reg_interval == 0 and self.step >= pl_warmup:
-            # pl_batch_shrink divides the PL batch size to reduce memory from
-            # create_graph=True + fp32: at 512px shrink=4 → batch 8→2, at 1024px shrink=8 → batch 4→1.
-            shrink = getattr(cfg, "pl_batch_shrink", 2)
-            torch.cuda.empty_cache()
-            z_pl = self._sample_z(max(1, cfg.batch_size // shrink))
+        # PL: skip during warmup (mean_path_length=0 at init would make pl_loss = pl_lengths²).
+        # create_graph=True + fp32 doubles peak VRAM; pl_batch_shrink keeps it from OOM.
+        if self.step % cfg.g_reg_interval == 0 and self.step >= cfg.pl_warmup_steps:
+            torch.cuda.empty_cache()  # reclaim activation memory from the main G step before create_graph
+            z_pl = self._sample_z(max(1, cfg.batch_size // cfg.pl_batch_shrink))
             # Differentiate synthesis only: run mapping under no_grad, promote w to a leaf.
             with torch.no_grad():
                 w_pl = self.G.mapping(z_pl)

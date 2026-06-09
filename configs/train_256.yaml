@@ -1,4 +1,4 @@
-# ── Resolution 256×256 ──────────────────────────────────────────────────────
+# ── Resolution 256×256 (from scratch) ────────────────────────────────────────
 resolution: 256
 z_dim: 512
 w_dim: 640
@@ -7,31 +7,25 @@ channel_max: 512
 mapping_layers: 12
 mapping_lr_mul: 0.01
 
-# Optimiser
-# lr 0.002 → 0.001: with beta1=0 Adam and 7 skip-RGB ToRGB blocks, lr=0.002
-# causes accumulated pre-tanh bias drift of ~4.2 in 300 steps → tanh saturates
-# at +1 (all-white collapse) before G can learn anything.
-# lr=0.001 halves the drift (~2.1 in 300 steps) keeping pre-tanh below saturation.
+# lr=0.001: with beta1=0 Adam, lr=0.002 causes pre-tanh bias drift ~4.2 in 300 steps
+# → tanh saturation (all-white collapse). lr=0.001 keeps drift ~2.1, below saturation.
 lr_g: 0.001
 lr_d: 0.001
 grad_clip: 1.0
 
-# Lazy regularisation
 d_reg_interval: 16
 g_reg_interval: 4
 r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
 pl_warmup_steps: 0
+pl_batch_shrink: 2   # batch 16 → 8 for PL step; create_graph+fp32 doubles VRAM
 
-# Data
 batch_size: 16
 num_workers: 4
 
-# Training schedule
 total_kimg: 25000
 
-# Logging / evaluation
 log_interval: 500
 sample_interval: 1000
 fid_interval: 5000

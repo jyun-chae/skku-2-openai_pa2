@@ -1,4 +1,4 @@
-# ── Resolution 512×512 (fine-tune from 256 checkpoint) ─────────────────────
+# ── Resolution 512×512 (fine-tune from 256 checkpoint) ──────────────────────
 resolution: 512
 z_dim: 512
 w_dim: 640
@@ -16,11 +16,11 @@ g_reg_interval: 4
 r1_gamma: 10.0
 pl_weight: 2.0
 pl_decay: 0.01
-# mean_path_length is NOT transferred from the 256 checkpoint (different resolution
-# → different path lengths). Trainer starts fresh at 0, so a short warmup prevents
-# the first PL step from using target=0 against the loaded 256 model's path lengths.
+# mean_path_length is NOT transferred from the 256 checkpoint (path-length scale differs by resolution).
+# pl_warmup_steps > 0 prevents the first PL step from targeting 0 when loading a higher-res model.
 pl_warmup_steps: 0
-pl_batch_shrink: 4
+pl_batch_shrink: 4   # batch 8 → 2 for PL step; create_graph+fp32 doubles VRAM
+r1_batch_shrink: 2   # batch 8 → 4 for R1 step; from_rgb@512px is 8×256×512×512×4=2GiB
 
 batch_size: 8
 num_workers: 4
